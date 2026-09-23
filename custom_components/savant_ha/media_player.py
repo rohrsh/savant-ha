@@ -135,10 +135,11 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             active_services = self._active_services()
             if self._service_id in active_services:
                 return self._optimistic_state or MediaPlayerState.ON
-            if active_services:
+            # An empty ActiveService push is the host's authoritative idle state
+            # (PROTOCOL.md §5.4b); optimistic state only bridges the gap before the
+            # room has pushed at all (e.g. right after startup).
+            if active_services or self._room_activity_known():
                 return MediaPlayerState.OFF
-            # ASSUMPTION: no Apple TV-specific state has been captured. Retain the last
-            # requested state until the room's authoritative ActiveService changes.
             return self._optimistic_state or MediaPlayerState.OFF
         if self._power_off_requested:
             return MediaPlayerState.OFF
@@ -518,6 +519,13 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             if isinstance(value, str):
                 services.update(part.strip() for part in value.split(",") if part.strip())
         return services
+
+    def _room_activity_known(self) -> bool:
+        """Whether the room has pushed any activity state, even an empty one."""
+        return any(
+            isinstance(self._state(f"{self._room}.{attribute}"), str)
+            for attribute in ("ActiveService", "ActiveServices")
+        )
 
     @property
     def _activity_is_addressable(self) -> bool:

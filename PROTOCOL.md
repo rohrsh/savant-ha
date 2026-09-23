@@ -346,6 +346,14 @@ additional candidate keys can be identified before capturing them on the WSS bus
 cycling sources through a room. The host's CLI state surface had reported the same
 names earlier, confirming the two surfaces share one state center.
 
+Staleness: `ActiveAudioService` and `ZoneIsActive` were observed (2026-09-23) still
+asserting a room's last audio session hours after `ActiveService` had cleared to `''`.
+An empty `ActiveService` push is the authoritative room-idle signal; the audio-zone
+flags can lag or persist indefinitely and must not be treated as current routing truth
+(§7). The host also has no visibility of audio fed to a room's amplifier outside the
+matrix (e.g. a network stream straight into the amp): its asserted state simply omits
+such activity.
+
 ### 5.5 Global — `global.CurrentTemperature`, `global.LightsAreOn`, `global.SonosGroups`, `Energy.Grid.IsAvailable`.
 
 `global.CurrentMinute` was observed on the reference host: pushed on registration and at
@@ -462,3 +470,7 @@ CoolMaster setter shapes and fan auto/cycle remain uncaptured and disabled.
 12. **`global.CurrentMinute`** — observed on one host (§5.5); universality unknown.
 13. **CLI-only room keys** — *resolved*: `ActiveVideoService`, `ZoneHasAudio`, and
     `ZoneHasVideo` were live-observed as WSS pushes on a running install (§5.4b).
+14. **Audio-flag staleness semantics** — `ActiveAudioService`/`ZoneIsActive` persisting
+    after `ActiveService` clears (§5.4b): unknown whether the host retains them as
+    "last audio session" by design or fails to clear them. Whether any later event
+    resets them (a new session in that room, a host reboot) is unobserved.

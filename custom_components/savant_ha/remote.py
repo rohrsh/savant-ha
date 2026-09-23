@@ -62,13 +62,17 @@ class SavantEndpointRemote(SavantEntity, RemoteEntity):
     @property
     def is_on(self) -> bool:
         services: set[str] = set()
+        known = False
         for attribute in ("ActiveService", "ActiveServices"):
             value = self._state(f"{self._room}.{attribute}")
             if isinstance(value, str):
+                known = True
                 services.update(p.strip() for p in value.split(",") if p.strip())
         if self._service_id and self._service_id in services:
             return True
-        if services:
+        # An empty push is the host's authoritative idle (PROTOCOL.md §5.4b);
+        # optimistic state only covers the window before the room pushes at all.
+        if known:
             return False
         return bool(self._optimistic_on)
 
