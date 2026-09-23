@@ -21,6 +21,7 @@ PLATFORMS: list[Platform] = [
     Platform.FAN,
     Platform.LIGHT,
     Platform.MEDIA_PLAYER,
+    Platform.REMOTE,
     Platform.SCENE,
     Platform.SENSOR,
 ]

@@ -411,6 +411,7 @@ Observed verbs used by this integration:
 | `PowerOn` / `PowerOff` | AV (any `SVC_AV_*`) | no args (live-verified for `SVC_AV_SAVANTMUSIC` and `SVC_AV_ENHANCEDDVD`; §5.4b) |
 | `Play` / `Pause` / `SkipUp` / `SkipDown` | AV | no args (live-verified for `SVC_AV_SAVANTMUSIC`; archive-declared elsewhere) |
 | `MuteOn` / `MuteOff` / `VolumeUp` / `VolumeDown` | AV | no args (archive-declared; not yet live-verified — §5.4b) |
+| `OSDCursorUp/Down/Left/Right` / `OSDSelect` / `Menu` | Apple TV | no args (archive-declared; native-app usage captured — §5.4). Sent via the remote entity's `send_command`, which accepts any request the endpoint declares. |
 | `Seek` | music AV | `{ProgressValue:<int 0-100>}` (`SVC_AV_SAVANTMUSIC`) |
 | `__RoomSetBrightness` | lighting | `{BrightnessLevel:<0|100>,useLastDimmerValue:true}`; omits component/logical fields |
 | `DimmerSet` | lighting | Standard dimmers omit color fields; color loads use nested `bleColor`; Lutron has its captured backend shape |
