@@ -28,6 +28,8 @@ from .const import (
     DOMAIN,
     MUSIC_ZONE_PREFIX,
     SVC_AV_SAVANTMUSIC,
+    VERB_MUTE_OFF,
+    VERB_MUTE_ON,
     VERB_PAUSE,
     VERB_PLAY,
     VERB_POWER_OFF,
@@ -37,6 +39,8 @@ from .const import (
     VERB_SKIP_DOWN,
     VERB_SKIP_UP,
     VERB_STOP_REPEAT,
+    VERB_VOLUME_DOWN,
+    VERB_VOLUME_UP,
 )
 from .control import audio_zone_logical_component, coerce_number, parse_media_time
 from .entity import SavantEntity
@@ -101,6 +105,7 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         self._power_off_requested = False
         self._optimistic_state: MediaPlayerState | None = None
         self._optimistic_volume: float | None = None
+        self._optimistic_mute: bool | None = None
         self._browse_nodes: dict[str, dict[str, object]] = {}
         self._browse_artwork: dict[str, bytes] = {}
         self._music_active = asyncio.Event()
@@ -157,6 +162,10 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             features |= MediaPlayerEntityFeature.TURN_OFF
         if VERB_SET_VOLUME in self._requests:
             features |= MediaPlayerEntityFeature.VOLUME_SET
+        if VERB_VOLUME_UP in self._requests and VERB_VOLUME_DOWN in self._requests:
+            features |= MediaPlayerEntityFeature.VOLUME_STEP
+        if VERB_MUTE_ON in self._requests and VERB_MUTE_OFF in self._requests:
+            features |= MediaPlayerEntityFeature.VOLUME_MUTE
         if VERB_PLAY in self._requests:
             features |= MediaPlayerEntityFeature.PLAY
         if VERB_PAUSE in self._requests:
@@ -199,6 +208,15 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         if (number := coerce_number(value)) is not None:
             return max(0.0, min(1.0, number / _RAW_VOLUME_MAX))
         return self._optimistic_volume
+
+    @property
+    def is_volume_muted(self) -> bool | None:
+        value = self._state(f"{self._room}.IsMuted", self._value("IsMuted"))
+        if isinstance(value, bool):
+            return value
+        if (number := coerce_number(value)) is not None:
+            return bool(number)
+        return self._optimistic_mute
 
     @property
     def media_position(self) -> float | None:
@@ -285,12 +303,29 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         self._optimistic_volume = volume
         self.async_write_ha_state()
 
+    async def async_volume_up(self) -> None:
+        if VERB_VOLUME_UP in self._requests:
+            await self._media_request(VERB_VOLUME_UP)
+
+    async def async_volume_down(self) -> None:
+        if VERB_VOLUME_DOWN in self._requests:
+            await self._media_request(VERB_VOLUME_DOWN)
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        verb = VERB_MUTE_ON if mute else VERB_MUTE_OFF
+        if verb not in self._requests:
+            return
+        await self._media_request(verb)
+        self._optimistic_mute = mute
+        self.async_write_ha_state()
+
     async def async_media_play(self) -> None:
         if VERB_PLAY not in self._requests:
             return
         await self._media_request(VERB_PLAY)
-        if self._service_type != SVC_AV_SAVANTMUSIC:
+        if self._service_type != SVC_AV_SAVANTMUSIC and VERB_STOP_REPEAT in self._requests:
             # The native app immediately cancels repeat after Apple TV Play (PROTOCOL.md §5.4).
+            # Other AV types do not declare StopRepeat, so the request stays Apple TV-only.
             await self._media_request(VERB_STOP_REPEAT)
         self._power_off_requested = False
         self._optimistic_state = MediaPlayerState.PLAYING

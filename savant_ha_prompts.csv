@@ -162,3 +162,61 @@ timestamp_epoch_ms,timestamp_iso_utc,session_id,session_title,prompt
 2026-09-18 16:16:17.072 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload [{'URI': 'avc/Music/Audio Zone 4', 'payload': {'key': '<ARTWORK_KEY>', 'type': 'thumbnailArtwork'}}] "
 1789774978195,2026-09-18T23:42:58.195000Z,ses_savant_ha2_000,Synchronize capture audit,"I had the reverse engineering side perform a complete audit of the documentation and existing log files.  Its repo has been updated.  Pay particular attention to  CAPTURE_AUDIT.md.  Pull these changes and perform the necessary changes to have sync with them"
 1789776656821,2026-09-19T00:10:56.821000Z,ses_savant_ha2_000,Continue or clarify,"Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+"1790030000000","2026-09-21T22:33:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Read HANDOVER.md and AGENTS.md, then review PR 1 (step 1–5 of the plan) on the generic-av-endpoints branch. 
+
+Some more thoughts on my spec
+1) clean onboarding. I have many Savant endpoints, so the flow needs to be manageable. Does the Home Assistant HomeKit controller integration offer any ideas (e.g. pick domains, then list each item in each domain on a page, click to next)
+2) diagnostics - I will want some indicator of live integration health - options there? Is the system minute helper universal?"
+"1790032000000","2026-09-21T23:06:40.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","And yes I'm quite keen on ""what is the room's status""? tell us what source the study media is playing right now, from Savan'ts point of view. I will later corroborate this inhome assistant by looking at the underlying device state ourselves."
+"1790036880428","2026-09-22T00:28:00.428000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","onboarding - yep, homekit bridge style. 
+Maybe this is how we gracefully expand the scope from the few entities the owner built at first, into all my options
+
+
+yes on a healthcheck boolean somehow
+one diagnostic-category binary_sensor (device_class connectivity)
+
+An earlier probe showed this data. Unclear if CurrentMinute is specific to my host or universal
+
+avant host-local user: <LOCAL_USER>
+Password: 
+23:17:32.138 WSS connected <HOST_IP>:<PORT> subprotocol=rpm-protocol
+23:17:32.252 deviceRecognized: authentication=True authorized=False build=9.4.6 featureLevel=9 users=[]
+23:17:32.435 login authorized=True  startZone=None
+23:17:32.435 registered 2 key(s); watching 120s - press Savant buttons now
+23:17:32.440 <- featureLock (1 msg)
+23:17:32.465 UPDATE Living.ActiveService = ''
+23:17:32.483 UPDATE global.CurrentMinute = 17
+23:17:32.685 UPDATE global.CurrentMinute = 17
+23:17:32.685 UPDATE Living.ActiveService = ''
+23:18:00.466 UPDATE global.CurrentMinute = 18
+^CTraceback (most recent call last):
+  File ""<LOCAL_PATH>/cpython-3.12."
+"1790040200000","2026-09-22T01:23:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","found it, Savant AirPlay 2 is there, just a different name - and Hass is reflecting the Savant device reality.
+
+zones can be turned off independantly
+
+collapsing into one player might be a bridge too far for this integration. could be handled in my config as a template media player?
+
+lets start though with sensors which list state of each room"
+"1790041247824","2026-09-22T01:40:47.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","correct the zone source is there
+
+Now from memory Savant keeps track of both the video and audio state in each room. Can we bring all of that in as diagnostics? Check my savant-ha ssh sclibridge sensor array
+
+More state data the better. Savant 'asserts' status, based on what it last issues as commands. That's problematic since it doesn't always check vs. actual. ""master of the universe"". So, I will need Home Assistant to check it's thinking. (downstream, not in this integration. just maximise the sensors/diagnostics at this stage)"
+"1790042250206","2026-09-22T01:57:30.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","this stuff 
+
+Also ssh gave us more cli sensors ... are they in this protocol? 
+
+How does the streaming data/artwork come into this integraton? For the Savant streamer
+[screenshots: old sclibridge device sensors (device power/input/volume/mute), SSH host diagnostics (load/memory/boot), Savant IP Audio 125 streamer metadata via <HOST_IP>:9095/albumart, and per-zone sensors ActiveAudioService/ActiveService/ActiveVideoService/CurrentVolume/IsMuted/ZoneHasAudio/ZoneHasVideo/ZoneIsActive]"
+"1790053614535","2026-09-22T05:06:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Applied that, cycled a few inputs through Study, have a look
+
+[next message] dude you have an MCP for 1va hass
+
+[next message, with screenshot of Study room diagnostics showing Active audio/video/service = Apple TV (variant 1), Zone active/has audio/has video On, Foxtel->Apple TV transitions] Is there a way to make home assistant MCP available to ALL claude code sessions? I did have it at claude desktop level at some point, but you didn't like the functionality over there"
+"1790053674535","2026-09-22T05:07:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","what's the tip to make hass-mcp work at user scope config for claude code? You'll see it exists in a few different projects, such as homelab
+
+Then my next challenge would be: can we drive Savant AppleTV commands from Hass? Like DPAD and play/pause"
+"1790119933164","2026-09-22T23:32:13.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Can you assess the savant understood state right now? I am streaming from Music Assistant direct to the study amp - linkplay perhaps? I did not 'tell' Savant this would be happening. I also note on lovelace/savant-study that both Apple TV and Foxtel are 'on' ... that seems inconsistent within Savant. Also our own media player on that page doesn't render Study Amp in action ... is that since we picked the DLNA media player
+[screenshot: Savant Study view - Active service idle, Audio service Savant AirPlay 2, Zone active On, Apple TV/Foxtel/AirPlay 2 source tiles all On]"
+"1790146254695","2026-09-23T06:50:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Thanks, park that for a moment. First need to fix the doorbell actions. The classic savant doorbell.wav method isn't working, I presume it relied on my old ssh technique, which I disabled. THoughts on best approach now?  We could still have one-time ssh commands if we have no other options. Are their savant services/methods for us to discover or trigger through the UDP path"

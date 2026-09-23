@@ -110,6 +110,12 @@ VERB_PAUSE = "Pause"
 VERB_STOP_REPEAT = "StopRepeat"
 VERB_SKIP_UP = "SkipUp"
 VERB_SKIP_DOWN = "SkipDown"
+# Archive-declared by every SVC_AV_* type (PROTOCOL.md §5.4b); live-verified so far
+# only for SetVolume/PowerOn/PowerOff on SVC_AV_ENHANCEDDVD.
+VERB_MUTE_ON = "MuteOn"
+VERB_MUTE_OFF = "MuteOff"
+VERB_VOLUME_UP = "VolumeUp"
+VERB_VOLUME_DOWN = "VolumeDown"
 VERB_SEEK = "Seek"
 VERB_ROOM_BRIGHTNESS = "__RoomSetBrightness"
 VERB_DIMMER_SET = "DimmerSet"
