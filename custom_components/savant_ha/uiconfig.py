@@ -281,6 +281,7 @@ def _parse_connection(conn: sqlite3.Connection) -> list[SavantDevice]:
             )
 
     _parse_media_zones(conn, tables, devices)
+    _parse_room_capabilities(conn, tables, rooms, devices)
     return devices
 
 
@@ -354,6 +355,54 @@ def _parse_media_zones(
             )
         )
     _disambiguate_media_names(devices[media_start:])
+
+
+# RoomCapabilities flags with a captured room-state surface (PROTOCOL.md §5.2);
+# flags such as hasSecurity/hasCameras have no captured `<room>.*` keys yet.
+_ROOM_CAPABILITY_FLAGS = ("hasAV", "hasLights", "hasFans", "hasShades", "hasVariableShades")
+
+
+def _parse_room_capabilities(
+    conn: sqlite3.Connection,
+    tables: list[str],
+    rooms: dict[Any, str],
+    devices: list[SavantDevice],
+) -> None:
+    """Emit one ``room`` device per physical room with a usable capability.
+
+    ``RoomCapabilities`` marks what each room contains (hasAV, hasLights, ...).
+    Rooms with none of the captured-state capabilities (scene/event containers
+    such as alarm events) are skipped. The flags drive which per-room diagnostic
+    sensors the sensor platforms create.
+    """
+    table = "RoomCapabilities"
+    if table not in tables:
+        return
+    cols = _table_columns(conn, table)
+    room_col = _pick(cols, ("roomID", "roomId", "room_id"))
+    if not room_col:
+        return
+    flag_cols = {flag: col for flag in _ROOM_CAPABILITY_FLAGS if (col := _pick(cols, (flag,)))}
+    if not flag_cols:
+        return
+    cursor = conn.execute(f'SELECT * FROM "{table}"')
+    for row in cursor:
+        d = _row_to_dict(cursor, row)
+        room = rooms.get(d.get(room_col))
+        if not room:
+            continue
+        capabilities = {flag: bool(d.get(col)) for flag, col in flag_cols.items()}
+        if not any(capabilities.values()):
+            continue
+        devices.append(
+            SavantDevice(
+                device_type="room",
+                name=room,
+                room=room,
+                entity_id=f"room:{d.get(room_col)}",
+                extra={"capabilities": capabilities},
+            )
+        )
 
 
 def _is_media_service(service_type: str, declared_requests: list[str]) -> bool:

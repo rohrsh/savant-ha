@@ -15,12 +15,14 @@ from .const import CONF_UID, DOMAIN, new_uid
 from .hub import SavantHub
 
 PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
     Platform.CLIMATE,
     Platform.COVER,
     Platform.FAN,
     Platform.LIGHT,
     Platform.MEDIA_PLAYER,
     Platform.SCENE,
+    Platform.SENSOR,
 ]
 
 

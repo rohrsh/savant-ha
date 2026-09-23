@@ -325,6 +325,27 @@ Device-level `IsPowered`/`CurrentPowerStatus` pushes lag ≈2 s; use room `Activ
 as the source of truth. `LastActiveService` updates on `PowerOn`. Other AV types'
 requests are archive-declared but not yet live-verified.
 
+Shared sources: `PowerOff` for a shared source active in multiple rooms deactivates only
+the addressed room's zone; other rooms keep playing (live-observed on the reference host
+with an AirPlay source in two rooms). Zones are independently switchable.
+
+Device-level endpoint states (live-observed alongside the room keys during the same
+test): `<component>.<logicalComponent>.<attr>` with `IsPowered` (0/1),
+`CurrentPowerStatus` ("ON"/"OFF"), `CurrentInput` (installer input label, e.g. an
+AV-input name), `CurrentVolume` (raw int), `CurrentMuteStatus` ("ON"/"OFF"). Observed on
+a Blu-ray player, a receiver, and a display; not every device class reports every
+attribute — unreported keys never push. These lag the room's `ActiveService` by ≈2 s,
+so they are diagnostics, not the power-state source of truth. The host's local CLI
+state surface reports the same key names and values (same state center), which is how
+additional candidate keys can be identified before capturing them on the WSS bus.
+
+`<room>.ZoneIsActive` (0/1) is pushed with the room keys, as are
+`<room>.ActiveVideoService` (the room's video service ID, alongside `ActiveService` and
+`ActiveAudioService` in the same second), `<room>.ZoneHasAudio`, and
+`<room>.ZoneHasVideo` (booleans) — live-observed on a running install 2026-09-22 while
+cycling sources through a room. The host's CLI state surface had reported the same
+names earlier, confirming the two surfaces share one state center.
+
 ### 5.5 Global — `global.CurrentTemperature`, `global.LightsAreOn`, `global.SonosGroups`, `Energy.Grid.IsAvailable`.
 
 `global.CurrentMinute` was observed on the reference host: pushed on registration and at
@@ -425,8 +446,8 @@ CoolMaster setter shapes and fan auto/cycle remain uncaptured and disabled.
    does not yet re-derive them from the state-key namespace.
 7. HVAC archive metadata supplies per-entity scale/range/capability flags on new imports;
    old persisted device records may require reconfiguration to acquire those fields.
-8. **Shared-source `PowerOff`** — the effect of powering off a shared source that is
-   active in two rooms at once has not been tested (does it deactivate one room or all?).
+8. **Shared-source `PowerOff`** — *resolved*: powering off a shared source deactivates
+   only the addressed room's zone; other rooms keep playing (§5.4b, live-observed).
 9. **`ServiceImplementationRequestMapEnabled.enabled`** is `0` on every row of the
    reference archive; its meaning is unknown — do not use it as a request filter.
 10. **Variant semantics** — `serviceVariantID` values are speaker-configuration choices
@@ -437,3 +458,5 @@ CoolMaster setter shapes and fan auto/cycle remain uncaptured and disabled.
     service scope) is uncaptured; they are excluded from media players and deferred to a
     future `remote` entity surface.
 12. **`global.CurrentMinute`** — observed on one host (§5.5); universality unknown.
+13. **CLI-only room keys** — *resolved*: `ActiveVideoService`, `ZoneHasAudio`, and
+    `ZoneHasVideo` were live-observed as WSS pushes on a running install (§5.4b).

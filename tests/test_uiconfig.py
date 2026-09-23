@@ -51,7 +51,18 @@ def _make_sqlite_bytes() -> bytes:
         "(id INTEGER PRIMARY KEY, ServiceImplementationZonedService_id INTEGER, "
         "ServiceImplementationRequests_id INTEGER)"
     )
+    conn.execute(
+        "CREATE TABLE RoomCapabilities (id INTEGER PRIMARY KEY, roomID INTEGER,"
+        " hasAV INTEGER, hasLights INTEGER, hasFans INTEGER, hasShades INTEGER,"
+        " hasVariableShades INTEGER)"
+    )
     conn.execute("INSERT INTO Rooms VALUES (1,'Kitchen','r1'),(2,'Living Room','r2')")
+    conn.execute(
+        "INSERT INTO RoomCapabilities VALUES"
+        # Kitchen: AV + lights. Living Room: no capability flags -> a scene/event
+        # container, no room device. Row 3 references no known room.
+        " (1,1,1,1,0,0,0), (2,2,0,0,0,0,0), (3,99,1,1,1,1,1)"
+    )
     conn.execute(
         "INSERT INTO Zones VALUES (10,'Kitchen','Environmental',"
         "'SVC_ENV_LIGHTING','Host'),(11,'Kitchen','Environmental',"
@@ -207,6 +218,16 @@ def test_parse_completed_archive_and_devices():
         "MuteOff",
     ]
     assert bluray.extra["service_id"] == "Kitchen-Blu ray-Bluray Player-1-SVC_AV_ENHANCEDDVD"
+
+    rooms = [d for d in devices if d.device_type == "room"]
+    assert [(d.name, d.room, d.entity_id) for d in rooms] == [("Kitchen", "Kitchen", "room:1")]
+    assert rooms[0].extra["capabilities"] == {
+        "hasAV": True,
+        "hasLights": True,
+        "hasFans": False,
+        "hasShades": False,
+        "hasVariableShades": False,
+    }
 
 
 def test_parse_archive_empty():
