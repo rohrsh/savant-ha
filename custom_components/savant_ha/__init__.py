@@ -7,12 +7,32 @@ live observation — see ``PROTOCOL.md`` and the sibling ``savant-app-re`` proje
 
 from __future__ import annotations
 
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
 
 from .const import CONF_UID, DOMAIN, new_uid
 from .hub import SavantHub
+
+SERVICE_SERVICE_REQUEST = "service_request"
+
+# The message shape is the observed ``service/request`` envelope (PROTOCOL.md §6);
+# the empty-string defaults mirror the host CLI's servicerequest argument shape,
+# which was live-used with SVC_ENV_AV_DOORBELL AutoStartAIS on the reference host.
+SERVICE_REQUEST_SCHEMA = vol.Schema(
+    {
+        vol.Required("service_type"): cv.string,
+        vol.Required("request"): cv.string,
+        vol.Optional("zone", default=""): cv.string,
+        vol.Optional("component", default=""): cv.string,
+        vol.Optional("logical_component", default=""): cv.string,
+        vol.Optional("variant_id", default="1"): cv.string,
+        vol.Optional("request_args"): dict,
+    }
+)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
@@ -33,6 +53,34 @@ def _get_hub(hass: HomeAssistant, entry: ConfigEntry) -> SavantHub:
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # YAML setup is not supported; configuration is via the UI only.
+
+    async def _async_service_request(call: ServiceCall) -> None:
+        """Send a raw ``service/request`` on every connected host (PROTOCOL.md §6).
+
+        Exposes the archive-declared non-AV services (doorbell announcements,
+        installer scene/alarm macros, ...) without an SSH side channel.
+        """
+        hubs: dict[str, SavantHub] = hass.data.get(DOMAIN, {})
+        if not hubs:
+            raise HomeAssistantError("No Savant host is configured")
+        for hub in hubs.values():
+            await hub.client.service_request(
+                call.data["request"],
+                component=call.data.get("component", ""),
+                service_type=call.data["service_type"],
+                zone=call.data.get("zone", ""),
+                logical_component=call.data.get("logical_component", ""),
+                variant_id=call.data.get("variant_id", "1"),
+                request_args=call.data.get("request_args") or None,
+                include_request_id=True,
+            )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SERVICE_REQUEST,
+        _async_service_request,
+        schema=SERVICE_REQUEST_SCHEMA,
+    )
     return True
 
 
