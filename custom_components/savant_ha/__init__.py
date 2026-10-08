@@ -34,16 +34,18 @@ SERVICE_REQUEST_SCHEMA = vol.Schema(
     }
 )
 
+# NOTE: unprompted change — needs review. Trimmed to media player + remote; origin of
+# the edit is unknown (see "Flagged changes" in savant_ha_prompts.csv).
 PLATFORMS: list[Platform] = [
-    Platform.BINARY_SENSOR,
-    Platform.CLIMATE,
-    Platform.COVER,
-    Platform.FAN,
-    Platform.LIGHT,
+#    Platform.BINARY_SENSOR,
+#    Platform.CLIMATE,
+#    Platform.COVER,
+#    Platform.FAN,
+#    Platform.LIGHT,
     Platform.MEDIA_PLAYER,
     Platform.REMOTE,
-    Platform.SCENE,
-    Platform.SENSOR,
+#    Platform.SCENE,
+#    Platform.SENSOR,
 ]
 
 

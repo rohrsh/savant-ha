@@ -220,3 +220,24 @@ Then my next challenge would be: can we drive Savant AppleTV commands from Hass?
 "1790119933164","2026-09-22T23:32:13.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Can you assess the savant understood state right now? I am streaming from Music Assistant direct to the study amp - linkplay perhaps? I did not 'tell' Savant this would be happening. I also note on lovelace/savant-study that both Apple TV and Foxtel are 'on' ... that seems inconsistent within Savant. Also our own media player on that page doesn't render Study Amp in action ... is that since we picked the DLNA media player
 [screenshot: Savant Study view - Active service idle, Audio service Savant AirPlay 2, Zone active On, Apple TV/Foxtel/AirPlay 2 source tiles all On]"
 "1790146254695","2026-09-23T06:50:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Thanks, park that for a moment. First need to fix the doorbell actions. The classic savant doorbell.wav method isn't working, I presume it relied on my old ssh technique, which I disabled. THoughts on best approach now?  We could still have one-time ssh commands if we have no other options. Are their savant services/methods for us to discover or trigger through the UDP path"
+"1790165847659","2026-09-23T12:17:27.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","[trimmed to the savant_ha-relevant part] I'm going to keep using my fork, whether he takes PR1 or not.
+
+Where do I read the '10 line csv'
+
+I suppor the idea of uploading to my fork, and detailing 5 commits"
+"1790166191163","2026-09-23T12:23:11.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Draft me a paragraph I can add to my first opened issue; pointing to my fork and those 5 ideas"
+"1790167340690","2026-09-23T12:42:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","[trimmed to the savant_ha-relevant part] Posted https://github.com/hpux735/savant-ha/issues/1
+
+PS where is my CSV chat log in my repo"
+"1791434546238","2026-10-08T04:42:26.238000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] whats the error on savant_ha (in active development)"
+"1791436211535","2026-10-08T05:10:11.535000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] I dont see custom_components/savant_ha/services.yaml on my home assistant"
+"1791436521038","2026-10-08T05:15:21.038000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","savant_ha ... am I using my own custom version, or the live github repo? just checking before I copy that one file. bit odd to be missing just 1"
+"1791437076083","2026-10-08T05:24:36.083000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] copied services.yaml and restarted, verify
+
+push to git?"
+"1791455522893","2026-10-08T10:32:02.893000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] trim the rows from anything not directly relevant to savant_ha
+
+No idea where he PLATFORMS trim came from 
+
+trim anything remotely PII/personal from CSV rows please"
+"1791456000000","2026-10-08T10:40:00.000000Z","flagged","Flagged changes","FLAGGED, NOT A PROMPT: custom_components/savant_ha/__init__.py PLATFORMS trimmed to MEDIA_PLAYER + REMOTE (BINARY_SENSOR, CLIMATE, COVER, FAN, LIGHT, SCENE, SENSOR commented out). Found as an uncommitted edit already running on the operator's HA (2026-09-29); no prompt in this CSV or in any session transcript, and the operator does not know its origin. Marked in source with '# NOTE: unprompted change — needs review'."

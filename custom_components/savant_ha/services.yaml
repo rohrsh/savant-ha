@@ -45,6 +45,6 @@ service_request:
         text:
     request_args:
       name: Request arguments
-      description: Optional request arguments object, e.g. {"VolumeValue": 20}
+      description: 'Optional request arguments object, e.g. {"VolumeValue": 20}'
       selector:
         object:
