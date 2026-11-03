@@ -28,15 +28,24 @@ UDP 9101/9103 discovery). The integration:
 ### HACS (recommended)
 
 1. HACS → **Integrations** → ⋮ → **Custom repositories**
-2. Add `https://git.housedillon.com/wdillon/savant-ha2` (category **Integration**)
+2. Add `https://github.com/rohrsh/savant-ha` (category **Integration**)
 3. **Download**, then restart Home Assistant.
 
 ### Manual
 
+Copy only the `custom_components/savant_ha` directory into your Home Assistant config
+(cloning the repository straight into `custom_components/savant_ha` would nest it one
+level too deep):
+
 ```bash
-cd /path/to/ha/config/custom_components
-git clone https://git.housedillon.com/wdillon/savant-ha2.git savant_ha
+git clone https://github.com/rohrsh/savant-ha.git /tmp/savant-ha
 ```
+
+```bash
+cp -r /tmp/savant-ha/custom_components/savant_ha /path/to/ha/config/custom_components/
+```
+
+Then restart Home Assistant.
 
 ## Configuration
 
