@@ -19,4 +19,4 @@ config/
 # captured wire/credential material must never be committed
 captures/
 *.pcap
-*.log
+*.log.DS_Store

@@ -39,6 +39,7 @@ from .const import (
     audio_zone_state_keys,
     build_default_subscribe_keys,
     device_state_keys,
+    endpoint_state_keys,
     new_uid,
     room_from_state_key,
     room_state_keys,
@@ -179,17 +180,23 @@ class SavantHub:
                     device.get("type") == "media_player"
                     and device.get("component")
                     and device.get("zone")
-                    and isinstance(device.get("control"), dict)
-                    and device["control"].get("service_type", SVC_AV_SAVANTMUSIC)
-                    == SVC_AV_SAVANTMUSIC
                 ):
+                    # Device-level power/input/volume pushes (PROTOCOL.md §5.4b).
                     subscribe_keys.extend(
-                        audio_zone_state_keys(
-                            device["component"],
-                            device["zone"],
-                            str(device["control"].get("variant_id") or "1"),
-                        )
+                        endpoint_state_keys(device["component"], device["zone"])
                     )
+                    if (
+                        isinstance(device.get("control"), dict)
+                        and device["control"].get("service_type", SVC_AV_SAVANTMUSIC)
+                        == SVC_AV_SAVANTMUSIC
+                    ):
+                        subscribe_keys.extend(
+                            audio_zone_state_keys(
+                                device["component"],
+                                device["zone"],
+                                str(device["control"].get("variant_id") or "1"),
+                            )
+                        )
 
         async def _async_mdns_hosts() -> list[str]:
             return await async_savant_mdns_hosts(hass)

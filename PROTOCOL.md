@@ -332,7 +332,78 @@ empty value means the room is idle. `LastActiveService` retains the previous end
 Apple TV-specific state or metadata key has been captured, so playback state and volume are
 optimistically reflected until `ActiveService` changes.
 
+### 5.4b Generic AV endpoints (all `SVC_AV_*` types)
+
+The config archive's `ServiceImplementationZonedService` rows enumerate every selectable
+AV endpoint per room (observed types on the reference host, Savant 9.4.6 / featureLevel 9:
+APPLEREMOTEMEDIASERVER, ENHANCEDDVD, EXTERNALMEDIASERVERAUDIO, GAME, GENERALAUDIO, HDMI,
+SATELLITETV, SATELLITETVAUDIO, SAVANTMUSIC, TV). The `service` column is the full service
+ID (`<Room>-<Component>-<LogicalComponent>-<variant>-<SVC_...>`) and equals the value the
+host pushes in `<room>.ActiveService`, so room activity authoritatively identifies the
+active endpoint for every type, not only Apple TV.
+
+Import rule: an endpoint becomes a media player when its archive request map
+(`ServiceImplementationRequestMap` → `ServiceImplementationRequests`) declares both
+`PowerOn` and `PowerOff`. Every AV endpoint on the reference host qualifies. Excluded
+from the per-endpoint request list:
+
+- `isCustom=1` rows — installer-authored requests (scenes, macros), not the service's
+  own control surface.
+- `<Component>_PowerToggle` / `SourcePowerToggle` — Savant-generated per-device toggles
+  (`active→active` transitions), unsuitable as a media-player power feature.
+  (ASSUMPTION: identified by name suffix only; see §7.)
+
+`serviceVariantID` distinguishes speaker-configuration variants of the same source in the
+same room (per the system owner); aliases usually differ per variant, and names fall back
+to a `(variant N)` suffix when they do not.
+
+Live verification (`SVC_AV_ENHANCEDDVD`, one room): the standard `service/request` shape
+(`{serviceType, zone, request, component, logicalComponent, variantID[, requestArgs]}`)
+was confirmed for `PowerOn`, `PowerOff`, and `SetVolume {VolumeValue}`. There is no
+response message; confirmation is state pushes only. Observed timings: `PowerOn` →
+`<room>.ActiveServices` then `ActiveService` = service ID and `ZoneIsActive` = 1 in
+≈0.24 s; `SetVolume` → `<room>.CurrentVolume` in ≈0.13–0.15 s; `PowerOff` →
+`ActiveService` `''` in ≈0.29 s. `<room>.CurrentVolume` mirrors the room amplifier on
+the raw 0–50 scale and arrives as **both** `'20'` (str) and `20` (int) — parse both.
+Device-level `IsPowered`/`CurrentPowerStatus` pushes lag ≈2 s; use room `ActiveService`
+as the source of truth. `LastActiveService` updates on `PowerOn`. Other AV types'
+requests are archive-declared but not yet live-verified.
+
+Shared sources: `PowerOff` for a shared source active in multiple rooms deactivates only
+the addressed room's zone; other rooms keep playing (live-observed on the reference host
+with an AirPlay source in two rooms). Zones are independently switchable.
+
+Device-level endpoint states (live-observed alongside the room keys during the same
+test): `<component>.<logicalComponent>.<attr>` with `IsPowered` (0/1),
+`CurrentPowerStatus` ("ON"/"OFF"), `CurrentInput` (installer input label, e.g. an
+AV-input name), `CurrentVolume` (raw int), `CurrentMuteStatus` ("ON"/"OFF"). Observed on
+a Blu-ray player, a receiver, and a display; not every device class reports every
+attribute — unreported keys never push. These lag the room's `ActiveService` by ≈2 s,
+so they are diagnostics, not the power-state source of truth. The host's local CLI
+state surface reports the same key names and values (same state center), which is how
+additional candidate keys can be identified before capturing them on the WSS bus.
+
+`<room>.ZoneIsActive` (0/1) is pushed with the room keys, as are
+`<room>.ActiveVideoService` (the room's video service ID, alongside `ActiveService` and
+`ActiveAudioService` in the same second), `<room>.ZoneHasAudio`, and
+`<room>.ZoneHasVideo` (booleans) — live-observed on a running install 2026-09-22 while
+cycling sources through a room. The host's CLI state surface had reported the same
+names earlier, confirming the two surfaces share one state center.
+
+Staleness: `ActiveAudioService` and `ZoneIsActive` were observed (2026-09-23) still
+asserting a room's last audio session hours after `ActiveService` had cleared to `''`.
+An empty `ActiveService` push is the authoritative room-idle signal; the audio-zone
+flags can lag or persist indefinitely and must not be treated as current routing truth
+(§7). The host also has no visibility of audio fed to a room's amplifier outside the
+matrix (e.g. a network stream straight into the amp): its asserted state simply omits
+such activity.
+
 ### 5.5 Global — `global.CurrentTemperature`, `global.LightsAreOn`, `global.SonosGroups`, `Energy.Grid.IsAvailable`.
+
+`global.CurrentMinute` was observed on the reference host: pushed on registration and at
+each minute boundary (value = current minute of the hour). Whether it exists on all
+hosts is unknown (§7); if universal, it is a guaranteed ≥1-push-per-minute liveness
+signal for the state bus.
 
 ### 5.6 Scenes
 Subscribe to dashboard state `scenesAndFoldersReduced` using `dis/dashboard/register`.
@@ -398,9 +469,12 @@ Observed verbs used by this integration:
 
 | Verb | Scope | args (observed) |
 |---|---|---|
-| `SetVolume` | AV | `{VolumeValue:<int 0-50 raw>}` |
-| `PowerOn` / `PowerOff` | music AV | no args (`SVC_AV_SAVANTMUSIC`) |
-| `Play` / `Pause` / `SkipUp` / `SkipDown` | music AV | no args (`SVC_AV_SAVANTMUSIC`) |
+| `SetVolume` | AV | `{VolumeValue:<int 0-50 raw>}` (live-verified for music, Apple TV, and `SVC_AV_ENHANCEDDVD`; §5.4b) |
+| `PowerOn` / `PowerOff` | AV (any `SVC_AV_*`) | no args (live-verified for `SVC_AV_SAVANTMUSIC` and `SVC_AV_ENHANCEDDVD`; §5.4b) |
+| `Play` / `Pause` / `SkipUp` / `SkipDown` | AV | no args (live-verified for `SVC_AV_SAVANTMUSIC`; archive-declared elsewhere) |
+| `MuteOn` / `MuteOff` / `VolumeUp` / `VolumeDown` | AV | no args (archive-declared; not yet live-verified — §5.4b) |
+| `OSDCursorUp/Down/Left/Right` / `OSDSelect` / `Menu` | Apple TV | no args (archive-declared; native-app usage captured — §5.4). Sent via the remote entity's `send_command`, which accepts any request the endpoint declares. |
+| `AutoStartAIS` / `AutoStopAIS` / `PageCallStart` / `PageCallStop` | doorbell/announcement (`SVC_ENV_AV_DOORBELL`) | no args. Archive-declared per room alongside power/volume/mute. `AutoStartAIS` with empty component/logicalComponent was live-used on the reference host via its own CLI to trigger the doorbell announcement in a zone; the integration exposes the same envelope through the `savant_ha.service_request` action. |
 | `Seek` | music AV | `{ProgressValue:<int 0-100>}` (`SVC_AV_SAVANTMUSIC`) |
 | `__RoomSetBrightness` | lighting | `{BrightnessLevel:<0|100>,useLastDimmerValue:true}`; omits component/logical fields |
 | `DimmerSet` | lighting | Standard dimmers omit color fields; color loads use nested `bleColor`; Lutron has its captured backend shape |
@@ -450,3 +524,21 @@ CoolMaster setter shapes and fan auto/cycle remain uncaptured and disabled.
    envelope or a same-account comparison with these sessions. Account/permission scope,
    scene type, host-version differences, and preceding native requests remain unverified;
    compare a fresh native session on the affected host before adding alternate requests.
+10. **Shared-source `PowerOff`** — *resolved*: powering off a shared source deactivates
+   only the addressed room's zone; other rooms keep playing (§5.4b, live-observed).
+11. **`ServiceImplementationRequestMapEnabled.enabled`** is `0` on every row of the
+   reference archive; its meaning is unknown — do not use it as a request filter.
+12. **Variant semantics** — `serviceVariantID` values are speaker-configuration choices
+    per the system owner; whether the numbering scheme (1–4 observed) is host-specific is
+    unknown. Variant rows have distinct `service` IDs on the reference archive.
+13. **`*_PowerToggle` requests** — Savant-generated per-device power toggles
+    (`active→active`); identified only by name suffix. Their exact routing (device vs
+    service scope) is uncaptured; they are excluded from media players and deferred to a
+    future `remote` entity surface.
+14. **`global.CurrentMinute`** — observed on one host (§5.5); universality unknown.
+15. **CLI-only room keys** — *resolved*: `ActiveVideoService`, `ZoneHasAudio`, and
+    `ZoneHasVideo` were live-observed as WSS pushes on a running install (§5.4b).
+16. **Audio-flag staleness semantics** — `ActiveAudioService`/`ZoneIsActive` persisting
+    after `ActiveService` clears (§5.4b): unknown whether the host retains them as
+    "last audio session" by design or fails to clear them. Whether any later event
+    resets them (a new session in that room, a host reboot) is unobserved.

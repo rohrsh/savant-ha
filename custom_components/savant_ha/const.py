@@ -47,6 +47,7 @@ DEVICE_TYPE_COVER = "cover"
 DEVICE_TYPE_FAN = "fan"
 DEVICE_TYPE_LOCK = "lock"
 DEVICE_TYPE_MEDIA_PLAYER = "media_player"
+DEVICE_TYPE_ROOM = "room"
 
 # ---- Protocol (PROTOCOL.md §1) --------------------------------------------
 # WebSocket subprotocol negotiated on the control channel.
@@ -111,6 +112,12 @@ VERB_PAUSE = "Pause"
 VERB_STOP_REPEAT = "StopRepeat"
 VERB_SKIP_UP = "SkipUp"
 VERB_SKIP_DOWN = "SkipDown"
+# Archive-declared by every SVC_AV_* type (PROTOCOL.md §5.4b); live-verified so far
+# only for SetVolume/PowerOn/PowerOff on SVC_AV_ENHANCEDDVD.
+VERB_MUTE_ON = "MuteOn"
+VERB_MUTE_OFF = "MuteOff"
+VERB_VOLUME_UP = "VolumeUp"
+VERB_VOLUME_DOWN = "VolumeDown"
 VERB_SEEK = "Seek"
 VERB_ROOM_BRIGHTNESS = "__RoomSetBrightness"
 VERB_DIMMER_SET = "DimmerSet"
@@ -151,6 +158,11 @@ ROOM_ATTRIBUTES = (
     "ActiveService",
     "ActiveServices",
     "LastActiveService",
+    "ZoneIsActive",  # 0/1, live-observed (PROTOCOL.md §5.4b).
+    # Live-observed as WSS pushes 2026-09-22 alongside ActiveService (PROTOCOL.md §5.4b).
+    "ActiveVideoService",
+    "ZoneHasAudio",
+    "ZoneHasVideo",
     "CurrentVolume",
     "IsMuted",
     "RelativeVolumeOnly",
@@ -209,6 +221,27 @@ def room_state_keys(rooms: set[str] | list[str]) -> list[str]:
         for attr in ROOM_ATTRIBUTES
         if attr != ROOM_CURRENT_TEMPERATURE
     ]
+
+# Device-level endpoint states pushed as ``<component>.<logicalComponent>.<attr>``
+# (PROTOCOL.md §5.4b, live-observed): IsPowered is 0/1, CurrentPowerStatus and
+# CurrentMuteStatus are "ON"/"OFF" strings, CurrentInput is the installer's input
+# label, CurrentVolume is a raw integer. Not every attribute exists on every
+# device class; unobserved keys simply never push.
+ENDPOINT_STATE_ATTRIBUTES = (
+    "IsPowered",
+    "CurrentPowerStatus",
+    "CurrentInput",
+    "CurrentVolume",
+    "CurrentMuteStatus",
+)
+
+
+def endpoint_state_keys(component: str, logical_component: str) -> list[str]:
+    """Return the device-level state keys for one AV endpoint component."""
+    return [
+        f"{component}.{logical_component}.{attr}" for attr in ENDPOINT_STATE_ATTRIBUTES
+    ]
+
 
 # Global attributes (PROTOCOL.md §5.4).
 GLOBAL_LIGHTS_ON = "global.LightsAreOn"
