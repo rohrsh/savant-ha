@@ -383,3 +383,21 @@ def test_coerce_number_accepts_strings_and_numbers():
     assert control.coerce_number("67F") == 67.0
     assert control.coerce_number("not-a-number") is None
     assert control.coerce_number(True) is None
+
+
+def test_import_domain_platform_mapping():
+    from custom_components.savant_ha import const
+
+    # Entries created before the domains step keep every platform.
+    assert const.selected_domains({}) == list(const.IMPORT_DOMAINS)
+    assert const.platforms_for_domains(const.selected_domains({})) == sorted(
+        ["binary_sensor", "climate", "cover", "fan", "light", "media_player", "remote",
+         "scene", "sensor"]
+    )
+    assert const.platforms_for_domains(["media_player"]) == ["media_player", "remote"]
+    assert const.selected_domains({"domains": ["scene", "media_player", "bogus"]}) == [
+        "media_player", "scene"
+    ]
+    assert const.device_types_for_domains(["media_player", "diagnostics"]) == {
+        "media_player", "room"
+    }

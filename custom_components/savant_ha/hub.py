@@ -26,6 +26,7 @@ from .const import (
     CONF_HOST,
     CONF_HOST_TOKEN,
     CONF_HOST_UID,
+    CONF_MEDIA_TOPOLOGY,
     CONF_PASSWORD,
     CONF_PORT,
     CONF_ROOMS,
@@ -33,15 +34,74 @@ from .const import (
     DOMAIN,
     LOGGER,
     SVC_AV_SAVANTMUSIC,
+    VERB_POWER_OFF,
+    VERB_POWER_ON,
     audio_zone_state_keys,
     build_default_subscribe_keys,
     device_state_keys,
+    endpoint_state_keys,
     new_uid,
     room_from_state_key,
     room_state_keys,
 )
 from .mdns import async_savant_mdns_hosts
+from .media_routing import MediaRouteManager, opaque_model_id
+from .room_media import room_sources
 from .savant_client import SavantClient
+
+
+class _ConfiguredMediaEndpoint:
+    """A non-entity endpoint retained so exact routing includes unimported zones."""
+
+    entity_id = None
+
+    def __init__(self, hub: SavantHub, device: dict[str, Any]) -> None:
+        self.hub = hub
+        self.route_id = str(device["id"])
+        self._component = str(device.get("component") or "Music")
+        self._logical_component = str(device.get("zone") or "")
+        self._room = str(device.get("room") or "")
+        control = device.get("control")
+        self._control = control if isinstance(control, dict) else {}
+        self._service_id = str(self._control.get("service_id") or "")
+        self._service_type = str(
+            self._control.get("service_type") or SVC_AV_SAVANTMUSIC
+        )
+        self._variant_id = str(self._control.get("variant_id") or "1")
+        self._requests = set(self._control.get("requests") or ())
+        if self._service_type == SVC_AV_SAVANTMUSIC and not self._requests:
+            self._requests = {VERB_POWER_ON, VERB_POWER_OFF}
+        self.savant_media_server_id = str(
+            self._control.get("media_server_id") or ""
+        ) or opaque_model_id("server", self._component, self._service_type)
+
+    def _is_active_service(self) -> bool:
+        return self._route_selection_state() is True
+
+    def _route_selection_state(self) -> bool | None:
+        services: set[str] = set()
+        for attribute in ("ActiveService", "ActiveServices"):
+            key = f"{self._room}.{attribute}"
+            if key not in self.hub.states:
+                return None
+            value = self.hub.get(key)
+            if isinstance(value, str):
+                services.update(part.strip() for part in value.split(",") if part.strip())
+        return self._service_id in services if self._service_id else bool(services)
+
+    async def _async_set_route_selected(self, selected: bool) -> None:
+        verb = VERB_POWER_ON if selected else VERB_POWER_OFF
+        if verb not in self._requests:
+            raise RuntimeError(f"Savant endpoint does not support {verb}")
+        await self.hub.client.service_request(
+            verb,
+            component=self._component,
+            service_type=self._service_type,
+            zone=self._room,
+            logical_component=self._logical_component,
+            variant_id=self._variant_id,
+            include_request_id=True,
+        )
 
 
 class SavantCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -76,6 +136,8 @@ class SavantHub:
         self._created: set[str] = set()
         self._flush_scheduled = False
         self._task: asyncio.Task | None = None
+        self._media_routes = MediaRouteManager()
+        self._room_media_entities: dict[str, str] = {}
 
         data = dict(entry.data)
         options = dict(entry.options or {})
@@ -83,6 +145,10 @@ class SavantHub:
         # The approved device list from the config-flow picker (None for legacy entries
         # that predate the picker — platforms then fall back to dynamic discovery).
         self.devices: list[dict[str, Any]] | None = data.get(CONF_DEVICES)
+        # Platforms forwarded for the entry's selected import groups (set at setup).
+        self.platforms: list[Any] | None = None
+        self.media_topology_complete = CONF_MEDIA_TOPOLOGY in data
+        self._media_topology: list[dict[str, Any]] = data.get(CONF_MEDIA_TOPOLOGY) or []
         # Known rooms: the room each approved device lives in + user-supplied override
         # rooms + rooms discovered at runtime (PROTOCOL.md §6.1).
         self.rooms: set[str] = set(options.get(CONF_ROOMS) or [])
@@ -90,19 +156,22 @@ class SavantHub:
             for device in self.devices:
                 if device.get("room"):
                     self.rooms.add(device["room"])
+        for device in self._media_topology:
+            if device.get("room"):
+                self.rooms.add(device["room"])
         self._non_room_state_prefixes = {
             f"{device['component']}.{device['zone']}"
-            for device in self.devices or []
+            for device in [*(self.devices or []), *self._media_topology]
             if device.get("type") == "media_player"
             and device.get("component")
             and device.get("zone")
         }
 
         has_archive_inventory = bool(
-            self.devices
+            (self.devices or self._media_topology)
             and any(
                 device.get("state_name") or device.get("component")
-                for device in self.devices
+                for device in [*(self.devices or []), *self._media_topology]
             )
         )
         subscribe_keys = build_default_subscribe_keys(
@@ -115,17 +184,23 @@ class SavantHub:
                     device.get("type") == "media_player"
                     and device.get("component")
                     and device.get("zone")
-                    and isinstance(device.get("control"), dict)
-                    and device["control"].get("service_type", SVC_AV_SAVANTMUSIC)
-                    == SVC_AV_SAVANTMUSIC
                 ):
+                    # Device-level power/input/volume pushes (PROTOCOL.md §5.4b).
                     subscribe_keys.extend(
-                        audio_zone_state_keys(
-                            device["component"],
-                            device["zone"],
-                            str(device["control"].get("variant_id") or "1"),
-                        )
+                        endpoint_state_keys(device["component"], device["zone"])
                     )
+                    if (
+                        isinstance(device.get("control"), dict)
+                        and device["control"].get("service_type", SVC_AV_SAVANTMUSIC)
+                        == SVC_AV_SAVANTMUSIC
+                    ):
+                        subscribe_keys.extend(
+                            audio_zone_state_keys(
+                                device["component"],
+                                device["zone"],
+                                str(device["control"].get("variant_id") or "1"),
+                            )
+                        )
 
         async def _async_mdns_hosts() -> list[str]:
             return await async_savant_mdns_hosts(hass)
@@ -149,6 +224,8 @@ class SavantHub:
         self.client.on_rooms_discovered = self._on_rooms_discovered
         self.client.on_scenes_update = self._on_scenes_update
         self.coordinator = SavantCoordinator(hass, self)
+        for device in self._media_topology:
+            self._media_routes.register_hidden(_ConfiguredMediaEndpoint(self, device))
 
     # ------------------------------------------------------------- lifecycle
 
@@ -183,6 +260,8 @@ class SavantHub:
     @callback
     def _on_state_update(self, state: str, value: Any) -> None:
         self.states[state] = value
+        if state.endswith((".ActiveService", ".ActiveServices")):
+            self._media_routes.notify_state_changed()
         # Derive new rooms from per-room state keys and subscribe to their other keys
         # (PROTOCOL.md §6.1: rooms are the first segments of per-room keys).
         room = room_from_state_key(state, self._non_room_state_prefixes)
@@ -205,6 +284,11 @@ class SavantHub:
     def _on_scenes_update(self, scenes: dict[str, dict[str, Any]]) -> None:
         """Replace the scene inventory from the dashboard's full-list push."""
         self.scenes = scenes
+        LOGGER.debug(
+            "Savant scene inventory delivered scenes=%d callbacks=%d",
+            len(scenes),
+            len(self._scene_callbacks),
+        )
         for callback_fn in list(self._scene_callbacks):
             callback_fn()
         self._schedule_flush()
@@ -247,3 +331,81 @@ class SavantHub:
 
     def unmark_created(self, unique_ids: list[str]) -> None:
         self._created.difference_update(unique_ids)
+
+    # ------------------------------------------------------------- media topology
+
+    def register_media_entity(self, entity: Any) -> None:
+        """Register one live projected media endpoint by its exact HA entity ID."""
+        self._media_routes.register(entity)
+
+    def unregister_media_entity(self, entity: Any) -> None:
+        self._media_routes.unregister(entity)
+
+    def media_entity(self, entity_id: str) -> Any | None:
+        return self._media_routes.entity(entity_id)
+
+    def media_entities(self) -> dict[str, Any]:
+        """Every registered per-source media entity, keyed by HA entity ID."""
+        return self._media_routes.entities()
+
+    def room_media_sources(self, room: str) -> list[Any]:
+        """The registered per-source media entities of one room (room_media.py)."""
+        return room_sources(self._media_routes.entities().values(), room)
+
+    def register_room_media_entity(self, room: str, entity_id: str) -> None:
+        self._room_media_entities[room] = entity_id
+
+    def unregister_room_media_entity(self, room: str) -> None:
+        self._room_media_entities.pop(room, None)
+
+    def room_media_entity_id(self, room: str) -> str | None:
+        return self._room_media_entities.get(room)
+
+    def room_for_media_entity(self, entity_id: str) -> str | None:
+        """Return the room whose room media player has this entity ID."""
+        return next(
+            (room for room, eid in self._room_media_entities.items() if eid == entity_id),
+            None,
+        )
+
+    def media_server_entities(self, media_server_id: str) -> list[Any]:
+        return self._media_routes.server_entities(media_server_id)
+
+    def selected_media_zone_entity_ids(self, media_server_id: str) -> list[str]:
+        """Derive shared-server membership centrally from authoritative room state."""
+        return self._media_routes.selected(media_server_id)
+
+    async def async_set_media_server_zones(
+        self, anchor: Any, zone_entity_ids: list[str]
+    ) -> dict[str, Any]:
+        """Replace one physical media server's complete projected endpoint set."""
+        if not self.media_topology_complete:
+            raise ValueError(
+                "Exact Savant media routing requires reconfiguring this integration "
+                "to refresh its complete media topology"
+            )
+        try:
+            return await self._media_routes.replace(anchor, zone_entity_ids)
+        finally:
+            self.coordinator.async_set_push_data(self.snapshot())
+
+    async def async_join_media_server_zones(
+        self, anchor: Any, zone_entity_ids: list[str]
+    ) -> None:
+        if not self.media_topology_complete:
+            raise ValueError("Savant media grouping requires refreshed media topology")
+        try:
+            await self._media_routes.join(anchor, zone_entity_ids)
+        finally:
+            self.coordinator.async_set_push_data(self.snapshot())
+
+    async def async_unjoin_media_server_zone(self, anchor: Any) -> None:
+        if not self.media_topology_complete:
+            raise ValueError("Savant media grouping requires refreshed media topology")
+        try:
+            await self._media_routes.unjoin(anchor)
+        finally:
+            self.coordinator.async_set_push_data(self.snapshot())
+
+    async def async_set_media_endpoint_power(self, endpoint: Any, selected: bool) -> None:
+        await self._media_routes.command(endpoint, selected)

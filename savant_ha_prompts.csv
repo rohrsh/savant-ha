@@ -162,3 +162,1185 @@ timestamp_epoch_ms,timestamp_iso_utc,session_id,session_title,prompt
 2026-09-18 16:16:17.072 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload [{'URI': 'avc/Music/Audio Zone 4', 'payload': {'key': '<ARTWORK_KEY>', 'type': 'thumbnailArtwork'}}] "
 1789774978195,2026-09-18T23:42:58.195000Z,ses_savant_ha2_000,Synchronize capture audit,"I had the reverse engineering side perform a complete audit of the documentation and existing log files.  Its repo has been updated.  Pay particular attention to  CAPTURE_AUDIT.md.  Pull these changes and perform the necessary changes to have sync with them"
 1789776656821,2026-09-19T00:10:56.821000Z,ses_savant_ha2_000,Continue or clarify,"Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+1790026955283,2026-09-21T21:42:35.283000Z,ses_savant_ha2_000,Fix Savant media search capability,"an audit of the media browsing/searching capability of the savant media service found that search woeks (provided a a few criteria are met) but `can_search` is set to false, which implies that search isn't implemented.  Look into this and ensure that media searching in savant devices are correctly implemented and idiomatic for home assistant"
+1790047327011,2026-09-22T03:22:07.013Z,ses_savant_ha2_000,Implement shared-media-server zone routing,"Implement explicit shared-media-server zone routing in the Savant Home Assistant integration.
+
+Background
+
+The integration currently creates one media_player entity per room/server combination. For example:
+
+- media_player.master_bath_music
+- media_player.dining_room_music
+- media_player.living_room_music
+
+These appear to Home Assistant as separate media players, but they are projections of the same physical Savant media server named ""Music."" The physical server can be routed to multiple Savant zones simultaneously.
+
+Calling media_player.play_media on media_player.master_bath_music starts content on the shared Music server. Every zone currently assigned to that server receives the audio. Targeting the Master Bath entity does not currently imply that Master Bath should be the only selected zone.
+
+There may be several independent physical servers, such as ""Music"" and ""Living Room Soundbar."" Do not associate entities by friendly name, entity ID naming patterns, room names, or source name alone. The relationship must come from stable identifiers in the Savant model.
+
+Goal
+
+Expose enough topology and one atomic routing operation so an external client can reliably perform this sequence:
+
+1. Identify which physical media server an endpoint entity represents.
+2. Identify the endpoint's Savant zone.
+3. See every endpoint currently selected for that server.
+4. Replace the server's complete zone selection with an exact desired set.
+5. Verify the final selected zones.
+6. Call media_player.play_media after routing is correct.
+
+A request to play media through media_player.master_bath_music alone should be implementable as:
+
+1. Set the Music server's selected endpoints to exactly [media_player.master_bath_music].
+2. Verify that Dining Room and other endpoints are no longer selected.
+3. Start playback through media_player.master_bath_music.
+
+Repository workflow
+
+Inspect the existing integration before editing. Follow its entity coordinator, API client, service registration, locking, naming, typing, and test conventions. Identify how the Savant API currently represents physical media servers, zones, source assignments, and active routes. Do not infer relationships from display names.
+
+Preserve existing entity IDs, unique IDs, and existing media_player behavior unless a change is explicitly required below.
+
+Entity topology
+
+Expose stable topology on every projected Savant media-player entity.
+
+At minimum, make these values available to integration code and in Home Assistant state attributes:
+
+- savant_media_server_id: stable identifier for the physical media server
+- savant_zone_id: stable identifier for the endpoint zone represented by this entity
+- savant_selected_zone_entity_ids: exact Home Assistant entity IDs currently selected for this physical server
+- savant_shared_media_server: true when multiple endpoint entities project the same physical server
+
+The exact attribute names may be adjusted to match existing integration conventions, but they must be documented and stable. Prefer opaque Savant identifiers over names.
+
+All aliases of the same physical server must report the same media-server identifier and the same selected-zone set. Each alias must report its own distinct zone identifier.
+
+Do not expose credentials, host details, internal tokens, or other sensitive data.
+
+Atomic service
+
+Add an integration service named:
+
+savant.set_media_server_zones
+
+The service should accept:
+
+- entity_id: one projected media-player entity used as the anchor that identifies the physical server
+- zone_entity_ids: the complete desired set of projected endpoint entities for that same physical server
+
+Example Home Assistant service data:
+
+{
+  ""entity_id"": ""media_player.master_bath_music"",
+  ""zone_entity_ids"": [
+    ""media_player.master_bath_music""
+  ]
+}
+
+The service uses entity_id only to identify the physical server. zone_entity_ids is replacement state, not a list of incremental additions.
+
+Required semantics
+
+- Resolve the anchor entity through the entity registry/runtime entity platform.
+- Determine its physical media-server ID from integration data, not its name.
+- Resolve every zone_entity_id to a Savant media-player entity.
+- Reject unknown entities.
+- Reject entities belonging to another integration.
+- Reject zone entities associated with a different physical media server.
+- Deduplicate repeated zone IDs.
+- Treat the desired list as the exact final routing set.
+- Deselect every currently active endpoint not in the desired set.
+- Select every desired endpoint not currently active.
+- Leave already-correct endpoints unchanged.
+- Serialize concurrent changes for the same physical server with a per-server lock or the integration's equivalent coordinator mechanism.
+- Refresh coordinator/entity state after the operation.
+- Verify the final selected-zone set after refresh.
+- Return an actionable Home Assistant service error if the requested final state cannot be reached.
+- Make repeated calls with an already-correct desired set idempotent.
+- Do not silently leave additional zones selected.
+- Do not use friendly names or entity ID parsing to determine server membership.
+
+If the Savant backend supports replacing the entire route in one API operation, use that operation.
+
+If the backend only supports individual select/deselect operations, perform them under one per-server lock and treat the whole operation as one logical transaction. Apply removals before additions unless the Savant API requires another safe ordering. If an intermediate operation fails, refresh actual state and report the resulting selected zones clearly. Do not claim success when only part of the requested topology was applied.
+
+Service response
+
+If the installed Home Assistant version and integration conventions support service responses, return a response similar to:
+
+{
+  ""media_server_id"": ""<stable opaque id>"",
+  ""requested_zone_entity_ids"": [
+    ""media_player.master_bath_music""
+  ],
+  ""selected_zone_entity_ids"": [
+    ""media_player.master_bath_music""
+  ],
+  ""deselected_zone_entity_ids"": [
+    ""media_player.dining_room_music""
+  ],
+  ""unchanged_zone_entity_ids"": [],
+  ""verified"": true
+}
+
+Use exact entity IDs in the response. Sort lists deterministically.
+
+If service responses are not supported, ensure the refreshed entity attributes provide the same verifiable final state.
+
+Empty selection
+
+Support an empty zone_entity_ids array if the Savant backend allows a server to have no selected endpoints. In that case, entity_id still identifies which physical server to modify.
+
+If Savant does not allow an empty routing set, reject it with a clear validation error rather than silently retaining a zone.
+
+Home Assistant grouping support
+
+Investigate whether this topology can also be represented safely through Home Assistant's standard media-player grouping API:
+
+- MediaPlayerEntityFeature.GROUPING
+- group_members
+- media_player.join
+- media_player.unjoin
+
+Implement standard grouping only if its semantics can accurately represent Savant routing.
+
+If implemented:
+
+- group_members must contain exact entity IDs for currently selected endpoint projections of the same physical server.
+- async_join_players must add only valid endpoint projections of that same server.
+- async_unjoin_player must deselect the target endpoint from its server.
+- Cross-server joins must be rejected.
+- Group operations and set_media_server_zones must use the same per-server lock and state-refresh path.
+
+Do not force Savant routing into Home Assistant grouping if doing so would be inaccurate. The atomic savant.set_media_server_zones service and stable topology attributes are required regardless.
+
+Playback behavior
+
+Do not automatically change all existing media_player.play_media behavior unless existing integration semantics and compatibility allow it.
+
+The primary contract should be:
+
+1. Route with savant.set_media_server_zones.
+2. Verify the selected zones.
+3. Invoke media_player.play_media.
+
+If you decide that calling play_media on a projected endpoint should automatically isolate that endpoint, document the behavioral change prominently and add compatibility tests. Prefer keeping routing explicit so existing Home Assistant automations are not silently changed.
+
+State consistency
+
+Ensure selection state updates promptly after:
+
+- set_media_server_zones
+- join
+- unjoin
+- turn_on
+- turn_off
+- external routing changes made directly through Savant
+
+If the integration uses a coordinator, the selected-zone topology should be derived centrally so aliases of one server cannot report inconsistent membership.
+
+Tests
+
+Add regression tests covering:
+
+- Multiple endpoint entities share one stable media-server ID.
+- Different physical servers have different IDs even if names are similar.
+- Each endpoint exposes its stable zone ID.
+- All aliases report the same selected-zone set.
+- Exact replacement removes previously selected zones.
+- Exact replacement adds newly requested zones.
+- Exact replacement both removes and adds zones.
+- An already-correct request is idempotent.
+- Duplicate requested entities are deduplicated.
+- Unknown entities are rejected.
+- Non-Savant entities are rejected.
+- Cross-server zone entities are rejected.
+- Empty selection works or fails explicitly according to backend capability.
+- Concurrent requests for one server are serialized.
+- A partial backend failure is surfaced and actual state is refreshed.
+- The service response reports the verified final topology.
+- External Savant routing changes appear after coordinator refresh.
+- Existing entity IDs, unique IDs, browsing, search, transport, volume, and playback behavior remain compatible.
+- Standard join/unjoin behavior, if implemented.
+
+Documentation
+
+Document:
+
+- Why several room entities may represent one shared physical media server.
+- The distinction between a media server and a zone endpoint.
+- The new topology attributes.
+- The exact replacement semantics of savant.set_media_server_zones.
+- A YAML example that isolates playback to one room.
+- A YAML example that selects multiple rooms.
+- How to deselect every room if supported.
+- Whether standard Home Assistant grouping is supported.
+
+Acceptance scenario
+
+Given these currently selected endpoints for the Music server:
+
+- media_player.master_bath_music
+- media_player.dining_room_music
+
+When this service is called:
+
+{
+  ""entity_id"": ""media_player.master_bath_music"",
+  ""zone_entity_ids"": [
+    ""media_player.master_bath_music""
+  ]
+}
+
+Then:
+
+- Dining Room is deselected from the Music server.
+- Master Bath remains selected.
+- The refreshed topology reports only media_player.master_bath_music.
+- The service reports verified success.
+- A subsequent play_media call through media_player.master_bath_music is heard only in Master Bath.
+- No relationship or target is inferred from the word ""Music"" or from an entity ID naming convention.
+
+Before implementation, summarize how the current Savant data model represents servers, zones, and routing. After implementation, report the files changed, the service contract, any Home Assistant grouping support added, compatibility implications, and all tests run."
+1790381809738,2026-09-26T00:16:49.738Z,,,continue
+1790381809738,2026-09-26T00:16:49.738Z,,,"Bug: Savant media_player returns HTTP 500 for standard transport services. The Savant integration's media_player entity accepts some service calls but returns 500 Internal Server Error for others, instead of a proper validation error. This breaks voice/MCP clients, which cannot distinguish ""unsupported"" from ""backend broken"". Entity in question: media_player.office_music (Savant Music), HA <HA_URL>. Reproductions (HA REST): POST /api/services/media_player/turn_off with body {""entity_id"": [""media_player.office_music""]} -> HTTP 500; POST /api/services/media_player/media_stop with body {""entity_id"": [""media_player.office_music""]} -> HTTP 500. Observed at 2026-09-25 ~23:34:55Z and 23:35:40Z respectively. Both failed within 62-64 ms, so this looks like an unhandled code path rather than a device timeout. browse_media, search_media, play_media, and media_pause all return 200 against the same entity. Requested fixes: 1. Implement turn_off and media_stop for the Savant player, or 2. If they are genuinely unsupported, raise a ServiceValidationError / return a 4xx so clients get a clear ""not supported"" signal rather than a 500. 3. Make supported_features accurately reflect callable services. The entity advertises bits that suggest transport support; clients use that bitmask to decide what to call, so advertising a service that 500s is worse than omitting the bit. 4. Check for any other standard media_player services that similarly 500, and audit that all transport commands (turn_on, turn_off, media_play, media_pause, media_stop, media_next_track, media_previous_track) either work or return a clean validation error. Secondary issue (causes client churn): the opaque media_content_id values returned by browse_media change on every call. Two consecutive browses of the same root returned identical titles/ordering but completely different IDs for every node, including all 50 Pandora stations. Stable identifiers across calls (or documented instability) would prevent clients from re-browsing the entire provider hierarchy. If IDs are inherently ephemeral, please document that so upstream clients can plan for it. Expected outcome: standard transport services either work or fail with a 4xx/validation error, never a 500, and supported_features matches reality."
+1790383880539,2026-09-26T00:51:20.539Z,,,commit and push
+1790698324294,2026-09-29T16:12:04.294Z,,,"the reverse engineering doc was updated with information about playing playlists normally and via shuffle.  Look into the integration and ensure that when a user is browing the media tree that playlist entries that support direct playback (not just starting the first song of a playlist) are marked as playable.  Also, see if there's an idiomatic way to handle shuffle."
+1790698813482,2026-09-29T16:20:13.482Z,,,"the docs were updated, hopefully that helps with shuffle behavior"
+1790699075413,2026-09-29T16:24:35.413Z,,,commit and push
+1790705088790,2026-09-29T18:04:48.790Z,,,"I think my home assistant has been updated with this change (631b5ac).  I'm not seeing shuffle advertised (check the Fall playlist on Amazon Music) on playlists that should support it.  Can you look into it?"
+1790705256765,2026-09-29T18:07:36.765Z,,,"On the savant app, I can click ""shuffle"" on the playlist, though"
+1790705499945,2026-09-29T18:11:39.945Z,,,"Ok, commit and push, and we'll try it"
+1790706248104,2026-09-29T18:24:08.104Z,,,"It's pushed.  Check the live instance via the MCP and see whether the result is as expected.  The UI in home assistant doesn't seem right.  The tracks now open as if they're folders, and there still doesn't seem to be a way to click play on a whole playlist, let alone shuffling"
+1790706570335,2026-09-29T18:29:30.335Z,,,"I don't think the ""Savant Music"" name is a good one.  If you have to use that model it should be named ""playlist"" or something like that."
+1790706736205,2026-09-29T18:32:16.205Z,,,"it is absolutely presented to the user, and more to the point it's also exposed to API/MCP clients and they don't know what to do with it either"
+1790706852709,2026-09-29T18:34:12.709Z,,,commit and push
+1790707431281,2026-09-29T18:43:51.281Z,,,media browsing is entirely broken now
+1790707876107,2026-09-29T18:51:16.107Z,,,commit and push
+1790708378168,2026-09-29T18:59:38.168Z,,,"there are now two entries in the playlist display with the name of the playlist.  Am I to assume these are the play list and shuffle list entries?"
+1790708685627,2026-09-29T19:04:45.627Z,,,commit and push
+1790887838579,2026-10-01T19:30:38.579Z,,Fix Savant Music search readiness,"You are debugging the custom Home Assistant `savant_ha` integration.
+
+Please fix the `media_player.search_media` failure for Savant Music.
+
+Observed failure:
+
+- Home Assistant service call:
+  `media_player.search_media`
+- Entity:
+  `media_player.office_music`
+- Search query:
+  `Fall`
+- Savant command sent:
+  `music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search`
+- Savant command was sent successfully at:
+  `2026-10-01 13:22:21.617`
+- `savant_client.py:825` waits for a `refresh` event using:
+  `asyncio.wait_for(refresh, MUSIC_SEARCH_READY_TIMEOUT)`
+- The refresh event never arrives before the timeout.
+- `savant_client.py:836` raises:
+  `SavantError(""Savant music search did not become ready"")`
+- `media_player.py:502` converts it to:
+  `SearchError(""Savant music search did not become ready"")`
+- Home Assistant returns HTTP 500 from `media_player.search_media`.
+
+Relevant traceback:
+
+```text
+/config/custom_components/savant_ha/savant_client.py:825
+    await asyncio.wait_for(refresh, MUSIC_SEARCH_READY_TIMEOUT)
+
+TimeoutError
+
+/config/custom_components/savant_ha/savant_client.py:836
+    raise SavantError(""Savant music search did not become ready"") from err
+
+/config/custom_components/savant_ha/media_player.py:498
+    result = await self.hub.client.async_search_music(...)
+
+/config/custom_components/savant_ha/media_player.py:502
+    raise SearchError(str(err) or ""Savant media search failed"") from err
+Please investigate and fix the search readiness protocol:
+1. Determine what Savant response or event should signal that the music search is ready.
+2. Verify whether the search command returns an immediate response, a delayed event, or updates a separate state/property.
+3. Confirm that the listener is subscribed before sending the search command, avoiding a race.
+4. Confirm that the refresh event is filtered by the correct component, logical component, service, request ID, or correlation identifier.
+5. Check whether AVB Stream 5 or SVC_AV_SAVANTMUSIC requires a different readiness signal than other music components.
+6. Handle delayed, missing, malformed, or error responses without producing an opaque HTTP 500.
+7. Return a structured Home Assistant SearchError with the actual Savant failure or timeout reason.
+8. Add regression tests for:
+- successful search readiness;
+- delayed readiness;
+- missing readiness timeout;
+- Savant error response;
+- unrelated refresh events;
+- multiple concurrent searches;
+- a search result that becomes available before the refresh event.
+Also review the integration capability declaration. The entity currently advertises search_media, but the search backend times out while browsing the same player works and exposes the FALL media item. If search cannot be made reliable, do not advertise search support until the readiness protocol is fixed."
+1790888485766,2026-10-01T19:41:25.766Z,,,"fix the malformed CSV row.  Use the opencode session database for authritative record of history if necessary"
+1790889622265,2026-10-01T19:59:42.265Z,,Fix concurrent music-search handling,"Please fix concurrent music-search handling in the custom Home Assistant `savant_ha` integration.
+
+The integration now handles individual `media_player.search_media` requests successfully, but concurrent searches against the same Savant Music player appear unreliable.
+
+Observed behavior:
+
+- Entity: `media_player.office_music`
+- Component: `Music`
+- Savant service: `SVC_AV_SAVANTMUSIC`
+- Individual searches such as `Fall`, `Chappell Roan`, and `Sabrina Carpenter` succeed.
+- When several searches are issued concurrently against the same entity, one may succeed while others return:
+  `Savant music search did not become ready`
+- The failure occurs while waiting for the search refresh/readiness event in `savant_client.py:825`.
+- The integration sends searches through the same Savant path, for example:
+  `music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search`
+
+Please investigate and fix concurrency safely:
+
+1. Determine whether Savant Music supports only one active search per component/service.
+2. If searches must be serialized, add a per-component or per-Savant-service async lock/queue.
+3. Ensure each queued request waits for its own response and readiness event.
+4. Correlate refresh events with the correct search request, component, logical component, service, and request identifier where available.
+5. Register event listeners before sending each search command to avoid races.
+6. Prevent one search timeout or error from cancelling or corrupting another search.
+7. Ensure stale refresh events from an earlier request cannot satisfy a later request.
+8. Preserve independent concurrency across unrelated Savant components where safe.
+9. Add useful diagnostic logging containing:
+   - search query;
+   - component and logical component;
+   - Savant service path;
+   - request/correlation ID;
+   - queue depth;
+   - readiness event received;
+   - timeout duration;
+   - response/result state.
+10. Return a meaningful Home Assistant `SearchError` on failure rather than an opaque HTTP 500.
+
+Add regression tests covering:
+
+- One successful search.
+- Two concurrent searches for the same component.
+- Multiple concurrent searches for the same component.
+- Concurrent searches for different components.
+- A delayed first search followed by a second search.
+- A stale readiness event.
+- A missing readiness event and timeout.
+- A Savant error response.
+- Cancellation of one queued request without affecting the remaining queue.
+- Correct result-to-query association for every completed request.
+
+Please also document whether the fix serializes searches globally, per hub, per component, or per Savant music service, and why."
+1790965878476,2026-10-02T16:31:18.476Z,,,"The timeout when searching music on the savant integration is too short.  It's common for it to take longer than 5 seconds, it seems"
+1790970989059,2026-10-02T17:56:29.059Z,,,"it's actually looking like ""Search Savant Music"" is just timing out all the time, even with 15-second waits.  Look into this and see if you can figure out why that's happening.  It's working for me in the savant app"
+1790971681301,2026-10-02T18:08:01.301Z,,,"It's still not working 2026-10-02 13:02:44.990 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:04:42.045 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=getRoot service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot request_id=873e7196a9f64db4a9f01dc37ceaa075
+2026-10-02 13:04:42.045 DEBUG (MainThread) [custom_components.savant_ha] Savant -> music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:04:42.086 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:04:42.128 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:42.140 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:42.144 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:42.147 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:42.151 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:42.155 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:45.158 DEBUG (MainThread) [custom_components.savant_ha] Savant file transfer timed out
+2026-10-02 13:04:45.159 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:45.167 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:45.173 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:45.178 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:04:48.180 DEBUG (MainThread) [custom_components.savant_ha] Savant file transfer timed out
+2026-10-02 13:04:48.181 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:04:49.834 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:04:49.834 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:04:49.834 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=9c204dad-3889-451a-be08-27ecff328e73
+2026-10-02 13:04:49.834 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:04:49.835 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=1cf671b79b47492badc6be32a48d0f82
+2026-10-02 13:04:49.842 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:04:49.843 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Lilly Allen' correlation_id=9c204dad-3889-451a-be08-27ecff328e73 ready=False result_nodes=malformed
+2026-10-02 13:05:04.844 WARNING (MainThread) [custom_components.savant_ha] Savant music search timed out query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=9c204dad-3889-451a-be08-27ecff328e73 timeout=15.0s
+2026-10-02 13:05:14.852 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:05:44.850 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))"
+1790972966391,2026-10-02T18:29:26.391Z,,,"Ok, so, if I start a new browse session with the music server and search the first time, it works great, and it's fast.  Then if I dismiss that search and try again, it just spins.  If I close that browse window entirely, and open it again search is again very fast.
+
+2026-10-02 13:22:51.898 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:51.905 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:51.909 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:51.914 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:54.915 DEBUG (MainThread) [custom_components.savant_ha] Savant file transfer timed out
+2026-10-02 13:22:54.916 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:56.725 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:22:56.725 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:22:56.725 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Lilly Allen' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=24e0cfd3-a39c-40fb-97c9-43f2d4217ede
+2026-10-02 13:22:56.725 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:22:56.727 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=42325f63d4794403b583d1eb364c2c74
+2026-10-02 13:22:56.775 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:22:56.775 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Lilly Allen' correlation_id=24e0cfd3-a39c-40fb-97c9-43f2d4217ede ready=True result_nodes=22
+2026-10-02 13:22:57.918 DEBUG (MainThread) [custom_components.savant_ha] Savant file transfer timed out
+2026-10-02 13:22:57.918 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:57.925 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:57.934 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:57.938 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:57.942 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:22:57.942 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:57.946 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:58.295 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:58.584 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:58.705 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:58.830 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:59.013 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:59.305 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:59.310 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:59.623 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:22:59.796 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:00.107 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:00.268 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:00.289 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:00.458 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:00.538 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:23:11.265 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:23:11.265 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:23:11.266 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=790170cc-59f3-4cc0-8ba4-963dc8c35c1a
+2026-10-02 13:23:11.266 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:23:11.267 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=77e7bed165c341c0ae08a239ac6d53fb
+2026-10-02 13:23:11.275 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:23:11.276 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Em Beihold' correlation_id=790170cc-59f3-4cc0-8ba4-963dc8c35c1a ready=False result_nodes=malformed
+2026-10-02 13:23:15.043 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:23:22.501 ERROR (MainThread) [homeassistant] Error doing job: Task exception was never retrieved (task: None)
+Traceback (most recent call last):
+  File (/usr/src/homeassistant/homeassistant/helpers/discovery_flow.py, line 133, in _async_start
+    await gather_with_limited_concurrency(FLOW_INIT_LIMIT, *init_coros)
+  File (/usr/src/homeassistant/homeassistant/util/async_.py, line 111, in gather_with_limited_concurrency
+    return await gather(
+           ^^^^^^^^^^^^^
+    ...<2 lines>...
+    )
+  File (/usr/src/homeassistant/homeassistant/util/async_.py, line 109, in sem_task
+    return await task
+           ^^^^^^^^^^
+  File (/usr/src/homeassistant/homeassistant/config_entries.py, line 1563, in async_init
+    flow, result = await self._async_init(flow_id, handler, context, data)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File (/usr/src/homeassistant/homeassistant/config_entries.py, line 1627, in _async_handle_step
+    result = await getattr(flow, method)(user_input)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File (/usr/src/homeassistant/homeassistant/components/kegtron/config_flow.py, line 37, in async_step_bluetooth
+    if not device.supported(discovery_info):
+           ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File (/usr/local/lib/python3.14/site-packages/bluetooth_sensor_state_data/__init__.py, line 84, in supported
+    self._start_update(data)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File (/usr/local/lib/python3.14/site-packages/kegtron_ble/parser.py, line 97, in _start_update
+    self._process_update(data)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+  File (/usr/local/lib/python3.14/site-packages/kegtron_ble/parser.py, line 117, in _process_update
+    port_name = str(port_name.decode(""utf-8"").rstrip(""\x00""))
+                    ~~~~~~~~~~~~~~~~~^^^^^^^^^
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xa5 in position 0: invalid start byte
+2026-10-02 13:23:36.780 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Em Biehold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=2
+2026-10-02 13:23:41.278 WARNING (MainThread) [custom_components.savant_ha] Savant music search timed out query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=790170cc-59f3-4cc0-8ba4-963dc8c35c1a timeout=30.0s
+2026-10-02 13:23:41.279 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Em Biehold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=2
+2026-10-02 13:23:41.279 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Em Biehold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=25bebfc7-e98b-44d0-9d6c-0bc029a08b9d
+2026-10-02 13:23:41.279 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:23:41.281 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=cdd1be140f4348808a7eeb58a366bc62
+2026-10-02 13:23:41.288 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:23:41.289 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Em Biehold' correlation_id=25bebfc7-e98b-44d0-9d6c-0bc029a08b9d ready=False result_nodes=malformed
+2026-10-02 13:23:44.690 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=2
+2026-10-02 13:23:53.340 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=3
+2026-10-02 13:24:11.289 WARNING (MainThread) [custom_components.savant_ha] Savant music search timed out query='Em Biehold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=25bebfc7-e98b-44d0-9d6c-0bc029a08b9d timeout=30.0s
+2026-10-02 13:24:11.290 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=2
+2026-10-02 13:24:11.290 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Em Beihold' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=19ec3536-955d-4581-ab5d-53bc11cda85a
+2026-10-02 13:24:11.290 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:24:11.292 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=105838155f914266b827926701176ded
+2026-10-02 13:24:11.335 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:24:11.335 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Em Beihold' correlation_id=19ec3536-955d-4581-ab5d-53bc11cda85a ready=True result_nodes=19
+2026-10-02 13:24:11.339 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=3
+2026-10-02 13:24:11.340 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=673ba2f3-eeb1-4460-8b95-8926b4ffb637
+2026-10-02 13:24:11.340 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:24:11.341 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=fa07a2689bf345e8853a1f3942cb6181
+2026-10-02 13:24:11.347 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:24:11.347 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Emancipator' correlation_id=673ba2f3-eeb1-4460-8b95-8926b4ffb637 ready=False result_nodes=malformed
+2026-10-02 13:24:14.854 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:24:41.348 WARNING (MainThread) [custom_components.savant_ha] Savant music search timed out query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=673ba2f3-eeb1-4468-8b95-8926b4ffb637 timeout=30.0s
+2026-10-02 13:24:48.912 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=getRoot service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot request_id=2b8ad5da07654b04a64767327acddad7
+2026-10-02 13:24:48.912 DEBUG (MainThread) [custom_components.savant_ha] Savant -> music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:24:48.959 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:24:49.037 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:24:49.037 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:24:49.039 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:24:53.611 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:24:53.611 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:24:53.611 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Emancipator' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=465e5137-195d-4f89-a8b9-7d1e1baafedb
+2026-10-02 13:24:53.611 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:24:53.613 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=c0223e7e145b4bb8b7c5791b728002f4
+2026-10-02 13:24:53.654 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:24:53.654 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Emancipator' correlation_id=465e5137-195d-4f89-a8b9-7d1e1baafedb ready=True result_nodes=18
+2026-10-02 13:24:53.690 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:53.699 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:53.825 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:53.910 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:54.165 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:54.595 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:54.855 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.143 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.291 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.370 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.488 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.604 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:24:55.832 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:05.869 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:25:05.869 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:25:05.869 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=9c329687-557e-449b-83e7-74254a440800
+2026-10-02 13:25:05.869 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:25:05.870 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=0d35f2afbc414dc9868bd19b13fc5b4f
+2026-10-02 13:25:05.878 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:25:05.878 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Benson Boone' correlation_id=9c329687-557e-449b-83e7-74254a440800 ready=False result_nodes=malformed
+2026-10-02 13:25:14.951 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:25:26.718 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-02 13:25:35.879 WARNING (MainThread) [custom_components.savant_ha] Savant music search timed out query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=9c329687-557e-449b-83e7-74254a440800 timeout=30.0s
+2026-10-02 13:25:42.481 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=getRoot service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot request_id=04ed99ad0fce4d3a9b9b1b99bbf866c4
+2026-10-02 13:25:42.481 DEBUG (MainThread) [custom_components.savant_ha] Savant -> music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:25:42.532 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/getRoot (1 message(s))
+2026-10-02 13:25:42.606 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:25:42.607 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:25:42.607 DEBUG (MainThread) [custom_components.savant_ha] Savant transfer label is still draining after a timeout
+2026-10-02 13:25:46.853 DEBUG (MainThread) [custom_components.savant_ha] Savant music search queued query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:25:46.854 DEBUG (MainThread) [custom_components.savant_ha] Savant music search started query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search queue_depth=1
+2026-10-02 13:25:46.854 DEBUG (MainThread) [custom_components.savant_ha] Savant music search request query='Benson Boone' component=Music logical_component=AVB Stream 5 service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search correlation_id=b15b4c28-74a4-4a91-a0c5-cc320dbc25d9
+2026-10-02 13:25:46.854 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2 message(s))
+2026-10-02 13:25:46.856 DEBUG (MainThread) [custom_components.savant_ha] Savant music RPC request operation=search service_path=music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search request_id=56861ef5b6d94839ae366b35258dea98
+2026-10-02 13:25:46.903 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search (1 message(s))
+2026-10-02 13:25:46.903 DEBUG (MainThread) [custom_components.savant_ha] Savant music search response query='Benson Boone' correlation_id=b15b4c28-74a4-4a91-a0c5-cc320dbc25d9 ready=True result_nodes=24
+2026-10-02 13:25:46.923 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.936 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.941 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.946 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.951 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.956 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.961 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.966 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.970 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:46.976 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.065 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.071 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.076 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.081 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.087 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.138 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.143 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.148 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-02 13:25:47.148 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))"
+1790973996064,2026-10-02T18:46:36.064Z,,,"It's getting better, but it's still not quite there yet.  I'm seeing a lot of timeouts, still.  [User supplied Savant/Home Assistant logs showing an initial search readiness timeout followed by a later retry succeeding after getRoot.]
+
+Why not always issue a getRoot when every search is issued?"
+1791005123603,2026-10-03T02:45:23.603Z,,,"Music search is appearing quite unreliable again :( [User supplied Savant/Home Assistant logs showing the first readiness attempt waiting 30 seconds and the getRoot recovery attempt succeeding immediately.]"
+1791005319388,2026-10-03T02:48:39.388Z,,,"Do you want to provide a prompt to ask the reverse engineering LLM for clarifications for how search appears to be working in the packet traces?"
+1791007348249,2026-10-03T06:02:28.249Z,,Correct captured music-search readiness,"results are committed and pushed.  the summary is: Completed the investigation and documented it in MUSIC_SEARCH_INVESTIGATION.md (MUSIC_SEARCH_INVESTIGATION.md). It contains the full timestamped evidence tables, answers to all 18 questions, chronological sequences, and an explicitly labeled client retry proposal.
+I reassembled and decoded all 21 source logs. There are 40 search request/reply pairs, but only one capture contains typed searches: capture-20260918T195239-ff447cfd.ndjson, with 13 typed requests across 11 search UUIDs.
+Main conclusions
+1. getRoot is not sent before every search
+Four repeated-text submissions return searchReady:true immediately with:
+- A fresh search UUID.
+- No intervening getRoot.
+- No refresh notification referencing the new UUID.
+For example, ""Benson "" first returns pending, then a later submission of that exact text with a fresh UUID returns 23 nodes in 55 ms, without getRoot between them.
+This is consistent with result reuse, but cache semantics are unproven. It also means that “a second getRoot followed by a search worked” does not establish that getRoot caused recovery.
+Conversely, the later ""Beatles"" search still returns pending after multiple getRoot calls. No server-side reset behavior is established.
+2. The documented pending response was wrong
+All seven captured pending typed-search replies contain:
+{
+  ""screenArguments"": {
+    ""searchReady"": false,
+    ""parentSubmenu"": [""...""]
+  },
+  ""nodes"": null
+}
+nodes:null is observed pending behavior—not inherently malformed or failed. I corrected the nodes:[] example in PROTOCOL.md.
+All captured search replies have a valid screenArguments map. Missing or malformed screenArguments in the reported HA behavior remains unverified by these native captures.
+3. Both refresh families are present, with different JSON wrappers
+Exact key templates:
+<component>.<logicalComponent>.refreshLMQ
+<component>.<logicalComponent>.refreshLMQ3
+They use the same component/logical component as the search endpoint, without a service-type segment or room prefix.
+Their value fields are JSON-encoded strings. After parsing those strings:
+refreshLMQ:
+{
+  ""from"": ""search`search:<SEARCH_UUID>"",
+  ""to"": ""search`search:<SEARCH_UUID>"",
+  ""time"": 1789761269928418000
+}
+refreshLMQ3:
+[
+  {
+    ""from"": ""search:<SEARCH_UUID>"",
+    ""to"": ""search:<SEARCH_UUID>"",
+    ""time"": 38
+  }
+]
+The backtick in the first format is literal. These reference the search UUID, not the RPC requestId.
+The native app registers these keys at 19:53:28.149553 and 19:53:28.170488, approximately five seconds before its first typed search.
+Captured successful sequences
+All times below are 2026-09-18 UTC. Identifiers are consistent redacted aliases; the report supplies raw-capture line references.
+New-text search: pending → refresh → retry → results
+Time	Event
+19:53:44.053288	R14 submits ""Benson boone"" with search UUID S10
+19:53:44.299940	R14 reply: searchReady:false, nodes:null
+19:53:45.401676	refreshLMQ references S10
+19:53:46.435334	refreshLMQ3 references S10
+19:53:46.542334	R15 repeats the search with same S10, new requestId
+19:53:46.587554	R15 response begins: searchReady:true, 24 nodes
+The retry changes only requestId. No getRoot occurs between attempts. It follows refreshLMQ3 by 107 ms, but follows refreshLMQ by 1.14 seconds.
+A second successful sequence, ""Beatles"", behaves similarly: both refresh entries arrive together, followed 167.632 ms later by a same-UUID/new-requestId retry. Total initial-request-to-result time is approximately 1.19 seconds.
+This is consistent with event-driven retries, especially following refreshLMQ3. It does not prove which event is necessary or sufficient, or exclude an internal timer.
+Repeated text: immediate results without getRoot
+Time	Event
+19:53:34.005650	R06/S02 submits ""Benson ""
+19:53:34.015275	Pending reply
+19:53:35.035711	refreshLMQ references S02
+19:53:36.437400	refreshLMQ3 references S02
+19:53:37.594701	R08/S04 submits the same text with a fresh UUID
+19:53:37.649808	Ready response: 23 nodes
+There is no intervening getRoot and no refresh naming S04. A client must accept an immediately ready RPC response without waiting for a notification.
+Delays, failures, and concurrency
+- No genuine search timeout or explicit failure response is captured. The first typed query is superseded by further typing, so it cannot honestly be presented as either an isolated successful cold-first query or a failed query.
+- Older refreshes arrive after newer searches—and sometimes after newer ready results. Match the UUID, not merely the component or arrival time.
+- A reconnect re-emits an identical old refresh value. Receiving a refresh does not necessarily mean a new search completed.
+- The native app submits new UUIDs while earlier searches are awaiting notifications. That does not establish backend concurrency, but it provides no basis for requiring every earlier search to finish before submitting another.
+- Artwork traffic interleaves with refresh delivery. Causal blocking or delay is not established.
+- Every typed request uses the same four-provider array. Provider-specific readiness differences cannot be isolated.
+Recommended implementation direction
+The capture-supported core is:
+1. Register both exact refresh keys before typed queries.
+2. Submit new input with a fresh search UUID and requestId.
+3. Accept searchReady:true results immediately.
+4. Treat searchReady:false, nodes:null as pending.
+5. Parse refresh-value JSON and match the current target and search UUID.
+6. Re-query with the same search UUID and a fresh requestId, without inserting getRoot.
+7. Ignore obsolete-query events and results.
+The report additionally specifies a proposed, unverified fallback policy: a three-second pending watchdog, five-second RPC timeout, twenty-second overall budget, and at most six transmissions per UUID. These are integration policy choices, not constants recovered from the native app. Timeout exhaustion is classified as inconclusive rather than a proven provider failure.
+The full tables and examples were checked automatically against the captures. Documentation and provenance updates are committed and pushed as 6750b23 — Investigate typed search readiness and repeated queries."
+1791007348250,2026-10-03T06:02:28.250Z,,,commit and push when you're done
+1791043050778,2026-10-03T15:57:30.778Z,,Add music search timing diagnostics,"that's all that's printed in the logs, so if you need those other notifications, you'll have to add more debug logging"
+1791043193692,2026-10-03T15:59:53.692Z,,,commit and push
+1791043782853,2026-10-03T16:09:42.853Z,,Try one-second search watchdog,"I was just using a different audio zone, but the same music service.  Let's try the 1 second watchdog"
+1791043932577,2026-10-03T16:12:12.577Z,,,commit and push
+1792164625214,2026-10-16T15:30:25.214Z,,Fix missing CoolMaster config-flow step,"it looks like it's breaking on adding coolmaster devices? 2026-10-16 08:19:16.323 WARNING (SyncWorker_0) [homeassistant.loader] We found a custom integration hacs which has not been tested by Home Assistant. This component might cause stability problems, be sure to disable it if you experience issues with Home Assistant
+2026-10-16 08:19:16.330 WARNING (SyncWorker_0) [homeassistant.loader] We found a custom integration savant_ha which has not been tested by Home Assistant. This component might cause stability problems, be sure to disable it if you experience issues with Home Assistant
+2026-10-16 08:19:37.649 WARNING (ImportExecutor_0) [py.warnings] /usr/local/lib/python3.14/site-packages/rich/segment.py:547: SyntaxWarning: 'return' in a 'finally' block
+  return
+2026-10-16 08:19:54.597 ERROR (Thread-5) [pychromecast.socket_client] [<PROJECT_NAME>(<OTHER_HOST_IP>):8009] Failed to connect to service MDNSServiceInfo(name='AVM-70-<DEVICE_UID>._googlecast._tcp.local.'), retrying in 5.0s
+2026-10-16 08:20:20.701 WARNING (MainThread) [homeassistant.bootstrap] Waiting for integrations to complete setup: {('lutron_caseta', '<CONFIGURATION_ID>'): 2394851.882019072}
+2026-10-16 08:24:39.489 ERROR (MainThread) [aiohttp.server] Unhandled exception
+Traceback (most recent call last):
+  File ""/usr/local/lib/python3.14/asyncio/base_events.py"", line 1302, in _sendfile_fallback
+    read = await self.run_in_executor(None, file.readinto, view)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+asyncio.exceptions.CancelledError
+During handling of the above exception, another exception occurred:
+Traceback (most recent call last):
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_protocol.py"", line 686, in start
+    resp, reset = await task
+                  ^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_protocol.py"", line 602, in _handle_request
+    resp, reset = await self.finish_response(request, resp, start_time)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_protocol.py"", line 841, in finish_response
+    await prepare_meth(request)
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_fileresponse.py"", line 289, in prepare
+    return await self._prepare_open_file(request, fobj, st, file_encoding)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_fileresponse.py"", line 419, in _prepare_open_file
+    return await self._sendfile(request, fobj, offset, count)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_fileresponse.py"", line 148, in _sendfile
+    await loop.sendfile(transport, fobj, offset, count)
+  File ""/usr/local/lib/python3.14/asyncio/base_events.py"", line 1281, in sendfile
+    return await self._sendfile_fallback(transport, file,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                         offset, count)
+                                         ^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/asyncio/base_events.py"", line 1311, in _sendfile_fallback
+    await proto.restore()
+  File ""/usr/local/lib/python3.14/asyncio/base_events.py"", line 263, in restore
+    self._transport.set_protocol(self._proto)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/asyncio/sslproto.py"", line 98, in set_protocol
+    self._ssl_protocol._set_app_protocol(protocol)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute '_set_app_protocol'
+2026-10-16 08:26:51.154 ERROR (MainThread) [aiohttp.server] Error handling request from <LOCAL_IP>
+Traceback (most recent call last):
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_protocol.py"", line 577, in _handle_request
+    resp = await request_handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_app.py"", line 563, in _handle
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/local/lib/python3.14/site-packages/aiohttp/web_middlewares.py"", line 117, in impl
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/security_filter.py"", line 98, in security_filter_middleware
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/forwarded.py"", line 80, in forwarded_middleware
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/request_context.py"", line 24, in request_context_middleware
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/ban.py"", line 88, in ban_middleware
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/auth.py"", line 251, in auth_middleware
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/headers.py"", line 39, in headers_middleware
+    response = await handler(request)
+               ^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/helpers/http.py"", line 92, in handle
+    result = await handler(request, **request.match_info)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/decorators.py"", line 81, in with_admin
+    return await func(self, request, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/config/config_entries.py"", line 252, in post
+    return await super().post(request, flow_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/components/http/data_validator.py"", line 72, in wrapper
+    return await method(view, request, data, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/helpers/data_entry_flow.py"", line 121, in post
+    result = await self._flow_mgr.async_configure(flow_id, data)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/data_entry_flow.py"", line 339, in async_configure
+    result = await self._async_configure(flow_id, user_input)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/config_entries.py"", line 1691, in _async_configure
+    return await super()._async_configure(flow_id, user_input)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/data_entry_flow.py"", line 387, in _async_configure
+    result = await self._async_handle_step(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        flow, cur_step[""step_id""], user_input
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File ""/usr/src/homeassistant/homeassistant/data_entry_flow.py"", line 555, in _async_handle_step
+    self._raise_if_step_does_not_exist(flow, result[""step_id""])
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File ""/usr/src/homeassistant/homeassistant/data_entry_flow.py"", line 583, in _raise_if_step_does_not_exist
+    raise UnknownStep(
+        f""Handler {flow.__class__.__name__} doesn't support step {step_id}""
+    )
+homeassistant.data_entry_flow.UnknownStep: Handler SavantConfigFlow doesn't support step coolmaster
+    )
+homeassistant.data_entry_flow.UnknownStep: Handler SavantConfigFlow doesn't support step coolmaster"
+1792165108410,2026-10-16T15:38:28.410Z,,Diagnose missing client-site scenes,"there's a client site that isn't loading the scenes from the savant host.  How should we diagnose this? there's nothing obvious in the logs"
+1792165714160,2026-10-16T15:48:34.160Z,,Expose native debug logging and scene diagnostics,"you are the integration, so you don't you add the ability to turn on debug logging?"
+1792165879572,2026-10-16T15:51:19.572Z,,,Commit and push
+1792166069466,2026-10-16T15:54:29.466Z,,Clarify scene diagnostic deployment,"this isn't yet the updated code, I'm running that on another host"
+1792166206155,2026-10-16T15:56:46.155Z,,Discuss Lutron duplicate-light detection,"The coolmaster detection is awesome.  Can we do something similar for lights that already exist from a lutron integration?"
+1792166305723,2026-10-16T15:58:25.723Z,,Target Caseta and RA2 Select duplicate lights,Caséta/RA2
+1792166668130,2026-10-16T16:04:28.130Z,,Inspect dashboard reply structure for missing scenes,"Ok, regarding the scenes.  New log with the new code; 2026-10-16 09:00:34.486 DEBUG (MainThread) [custom_components.savant_ha] Savant discovery: 2 control reply(ies)
+2026-10-16 09:00:47.905 INFO (MainThread) [custom_components.savant_ha] Savant probe: connecting to collect devices
+2026-10-16 09:00:47.924 INFO (MainThread) [custom_components.savant_ha] Savant TLS version=TLSv1.3 cipher=('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+2026-10-16 09:00:47.924 INFO (MainThread) [custom_components.savant_ha] Savant WS connected to <HOST_IP>:62472 (subprotocol=rpm-protocol, aiohttp=3.14.4)
+2026-10-16 09:00:47.924 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/devicePresent (1 message(s))
+2026-10-16 09:00:47.935 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/deviceRecognized (1 message(s))
+2026-10-16 09:00:47.935 INFO (MainThread) [custom_components.savant_ha] Savant deviceRecognized (authentication=True)
+2026-10-16 09:00:48.029 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/authenticationRequest (1 message(s))
+2026-10-16 09:00:48.042 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/authenticationResponse (1 message(s))
+2026-10-16 09:00:48.042 INFO (MainThread) [custom_components.savant_ha] Savant login successful
+2026-10-16 09:00:48.045 DEBUG (MainThread) [custom_components.savant_ha] Savant <- featureLock (1 message(s))
+2026-10-16 09:00:48.045 DEBUG (MainThread) [custom_components.savant_ha] Savant featureLock: [{'TrueImageUnlock': {'state': 'unconfigured', 'capacityAvailable': 0, 'controllersUnlocked': 0}}]
+2026-10-16 09:00:48.132 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-16 09:00:48.202 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (2 message(s))
+2026-10-16 09:00:48.204 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=scenesAndFoldersReduced
+2026-10-16 09:00:48.204 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1 message(s))
+2026-10-16 09:00:48.206 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:00:48.208 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:00:48.210 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:00:48.212 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (86 message(s))
+2026-10-16 09:00:48.214 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dcm/request (1 message(s))
+2026-10-16 09:00:48.216 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:00:48.218 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:00:48.221 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 09:00:48.221 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 09:00:48.223 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.224 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.226 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:00:48.228 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.228 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.238 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.238 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.241 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.241 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.464 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:00:48.872 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.872 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.875 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.876 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.879 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 09:00:48.879 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 09:00:48.891 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.891 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:00:48.894 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:00:48.894 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:01:07.991 DEBUG (MainThread) [custom_components.savant_ha] Savant uiconfig entity tables: {'CameraEntities': ['id', 'zoneID', 'name', 'componentName', 'logicalComponent', 'entityType', 'previewPath', 'fullscreenPath', 'previewURL', 'fullscreenURL', 'highSourceURL', 'lowSourceURL', 'highMulticastURL', 'lowMulticastURL', 'previewFormat', 'fullscreenFormat', 'highMulticastFormat', 'lowMulticastFormat', 'previewFramerate', 'fullscreenFramerate', 'previewStreamDecoder', 'fullscreenStreamDecoder', 'highMulticastStreamDecoder', 'lowMulticastStreamDecoder', 'hostname', 'username', 'password', 'cpassword', 'authentication', 'port', 'transport', 'partner', 'uriSource'], 'CameraRecorderEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'cloudRecording', 'keypressedEvent', 'motionEvent', 'noiseEvent', 'tamperEvent', 'mediaType', 'mediaStream', 'streamURL', 'username', 'password', 'authentication', 'partner'], 'DoorLockEntities': ['id', 'zoneID', 'name', 'entityType', 'addresses', 'lockCommand', 'unlockCommand', 'lockState', 'errorState', 'supportsStatus', 'supportsErrors', 'camera', 'partner', 'authentication'], 'EVChargerEntities': ['id', 'zoneID', 'name', 'ipAddress', 'address', 'startCommand', 'stopCommand', 'setRateCommand', 'linkedPM', 'linkedUID', 'linkedCircuitId', 'circuitId', 'chargerState', 'errorState', 'powerState', 'historyState', 'chargeRateState', 'chargeModeState', 'maxChargeRateState', 'minChargePowerState', 'maxChargePowerState', 'currentSessionEnergyState', 'currentSessionStartDateState', 'lastSessionEnergyState', 'lastSessionEndDateState', 'IsEVChargerConnectedState', 'IsEVChargerLinkedState', 'EVChargerScheduleState', 'partner', 'supportsErrors', 'supportsStatus', 'supportsRate'], 'EntryEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'serialNumber', 'securityCode', 'ringDuration', 'motionEvent', 'noiseEvent', 'tamperEvent', 'audioInterrupt', 'buttonConfiguration', 'authentication', 'partner', 'hasMotion', 'hasNoise', 'hasTamper', 'hasKeyPressed', 'chime'], 'FanEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'roomLightsControl', 'orderValue', 'isSceneable'], 'GarageEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'toggleCommand', 'openCommand', 'stopCommand', 'closeCommand', 'openState', 'errorState', 'supportsErrors', 'supportsStatus', 'supportsStop', 'camera'], 'HVACEntities': ['id', 'zoneID', 'name', 'addresses', 'temperatureSetPoints', 'heat', 'cool', 'auto', 'humiditySetPoints', 'humidify', 'dehumidify', 'hasExternalTempSensor', 'history', 'stateName', 'tempMinRange', 'tempMaxRange', 'tempBuffer', 'isCelsius', 'homeAway', 'authentication', 'partner'], 'HotWaterHeaterEntities': ['id', 'zoneID', 'name', 'address', 'setTempCommand', 'setCapacityCommand', 'setModeCommand', 'currentSetPointState', 'currentCapacityState', 'currentModeState', 'currentTempState', 'timeToSetPointState', 'hotWaterRemainState', 'partner', 'supportsErrors'], 'LightEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'entitySubType', 'technology', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'lightsAreOn', 'roomLightsControl', 'orderValue', 'isSceneable', 'naturalLightCapable', 'trueImageSupport', 'bleNetworkKey', 'bleGroupID', 'bleNodeID', 'isSavantLoad'], 'PoolAndSpaEntities': ['id', 'zoneID', 'name', 'entityType', 'auxiliaryNumber'], 'RemoteControlEntities': ['id', 'componentName', 'logicalComponent', 'zoneID', 'entityType', 'uid', 'buttonConfiguration'], 'SecuritySystemEntities': ['id', 'zoneID', 'name', 'componentName', 'entityType', 'partitionNumber', 'zoneNumber', 'hasBypass', 'hasLCDFeedback', 'statusState', 'bypassToggleState', 'bypassTextState', 'buttonAssignments', 'keypadLabels', 'smartPinConfig', 'emergencyLabels', 'partner'], 'ShadeEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'presetNumber', 'stateName', 'sceneNumber', 'orderValue', 'isSceneable']}
+2026-10-16 09:01:08.230 INFO (MainThread) [custom_components.savant_ha] Savant uiconfig parsed 189 device(s): {'climate': 13, 'light': 100, 'cover': 19, 'media_player': 57}
+2026-10-16 09:01:08.234 INFO (MainThread) [custom_components.savant_ha] Savant probe: authorized=True auth_response=True rooms=1 hvac=0 zones=0 devices=189
+2026-10-16 09:01:12.880 DEBUG (MainThread) [custom_components.savant_ha] Finished fetching savant_ha_coordinator data in 0.000 seconds (success: True)
+2026-10-16 09:01:15.885 DEBUG (MainThread) [custom_components.savant_ha] Savant discovery: 1 control reply(ies)
+2026-10-16 09:01:15.886 INFO (MainThread) [custom_components.savant_ha] Savant host endpoint changed
+2026-10-16 09:01:15.886 INFO (MainThread) [custom_components.savant_ha] Savant control port changed 0 -> 62472
+2026-10-16 09:01:18.786 DEBUG (MainThread) [custom_components.savant_ha] Savant scene platform waiting for dashboard inventory
+2026-10-16 09:01:21.816 DEBUG (MainThread) [custom_components.savant_ha] Savant discovery: 1 control reply(ies)
+2026-10-16 09:01:21.838 INFO (MainThread) [custom_components.savant_ha] Savant TLS version=TLSv1.3 cipher=('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+2026-10-16 09:01:21.838 INFO (MainThread) [custom_components.savant_ha] Savant WS connected to <HOST_IP>:62472 (subprotocol=rpm-protocol, aiohttp=3.14.4)
+2026-10-16 09:01:21.838 INFO (MainThread) [custom_components.savant_ha] Savant host connected
+2026-10-16 09:01:21.838 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/devicePresent (1 message(s))
+2026-10-16 09:01:21.889 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/deviceRecognized (1 message(s))
+2026-10-16 09:01:21.890 INFO (MainThread) [custom_components.savant_ha] Savant deviceRecognized (authentication=True)
+2026-10-16 09:01:21.988 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/authenticationRequest (1 message(s))
+2026-10-16 09:01:22.001 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/authenticationResponse (1 message(s))
+2026-10-16 09:01:22.001 INFO (MainThread) [custom_components.savant_ha] Savant login successful
+2026-10-16 09:01:22.001 INFO (MainThread) [custom_components.savant_ha] Savant discovered 1 new room(s)
+2026-10-16 09:01:22.005 DEBUG (MainThread) [custom_components.savant_ha] Savant <- featureLock (1 message(s))
+2026-10-16 09:01:22.005 DEBUG (MainThread) [custom_components.savant_ha] Savant featureLock: [{'TrueImageUnlock': {'state': 'unconfigured', 'capacityAvailable': 0, 'controllersUnlocked': 0}}]
+2026-10-16 09:01:22.006 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (21 message(s))
+2026-10-16 09:01:22.119 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-16 09:01:22.189 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (2 message(s))
+2026-10-16 09:01:22.191 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=scenesAndFoldersReduced
+2026-10-16 09:01:22.191 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1 message(s))
+2026-10-16 09:01:22.193 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:01:22.195 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:01:22.197 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:01:22.205 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1582 message(s))
+2026-10-16 09:01:22.210 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dcm/request (1 message(s))
+2026-10-16 09:01:22.212 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:01:22.215 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:01:22.219 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 09:01:22.219 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 09:01:22.221 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:01:22.221 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:01:22.223 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:01:22.223 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:01:22.225 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.230 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.232 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.233 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.236 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.238 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.340 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.342 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.344 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.346 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.348 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.350 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.351 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.353 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.355 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.359 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.361 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.364 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.365 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.367 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.369 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.372 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.374 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.376 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.377 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.380 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.381 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.383 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.386 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:01:22.386 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ value='{""from"":""browse`browse,getRoot*"",""to"":""browse`browse,getRoot"",""time"":1792166319058314000}'
+2026-10-16 09:01:22.386 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ reason=no_local_waiter active_searches=0
+2026-10-16 09:01:22.390 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))"
+1792166983153,2026-10-16T16:09:43.153Z,,Confirm app scenes and commit pending changes,"there are scenes in the savant app with this host.  Make sure you're committed and pushed and I'll update"
+1792167435419,2026-10-16T16:17:15.419Z,,Separate capture-backed dashboard registrations,"2026-10-16 09:16:09.967 INFO (MainThread) [custom_components.savant_ha] Savant probe: connecting to collect devices
+2026-10-16 09:16:09.988 INFO (MainThread) [custom_components.savant_ha] Savant TLS version=TLSv1.3 cipher=('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+2026-10-16 09:16:09.988 INFO (MainThread) [custom_components.savant_ha] Savant WS connected to <HOST_IP>:62472 (subprotocol=rpm-protocol, aiohttp=3.14.4)
+2026-10-16 09:16:09.988 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/devicePresent (1 message(s))
+2026-10-16 09:16:09.998 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/deviceRecognized (1 message(s))
+2026-10-16 09:16:09.999 INFO (MainThread) [custom_components.savant_ha] Savant deviceRecognized (authentication=True)
+2026-10-16 09:16:10.093 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/authenticationRequest (1 message(s))
+2026-10-16 09:16:10.103 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/authenticationResponse (1 message(s))
+2026-10-16 09:16:10.103 INFO (MainThread) [custom_components.savant_ha] Savant login successful
+2026-10-16 09:16:10.106 DEBUG (MainThread) [custom_components.savant_ha] Savant <- featureLock (1 message(s))
+2026-10-16 09:16:10.106 DEBUG (MainThread) [custom_components.savant_ha] Savant featureLock: [{'TrueImageUnlock': {'state': 'unconfigured', 'capacityAvailable': 0, 'controllersUnlocked': 0}}]
+2026-10-16 09:16:10.197 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-16 09:16:10.267 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (2 message(s))
+2026-10-16 09:16:10.269 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=scenesAndFoldersReduced
+2026-10-16 09:16:10.270 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1 message(s))
+2026-10-16 09:16:10.272 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:16:10.274 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:16:10.275 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:16:10.277 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (86 message(s))
+2026-10-16 09:16:10.279 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dcm/request (1 message(s))
+2026-10-16 09:16:10.281 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:16:10.283 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 09:16:10.286 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 09:16:10.287 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=4
+2026-10-16 09:16:10.287 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 09:16:10.290 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.291 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.293 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:16:10.294 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.295 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.302 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.303 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.305 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.306 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.503 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:16:10.954 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.954 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.957 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.957 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.960 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 09:16:10.961 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=4
+2026-10-16 09:16:10.961 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 09:16:10.974 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.974 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:10.978 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 09:16:10.978 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 09:16:11.113 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:16:30.055 DEBUG (MainThread) [custom_components.savant_ha] Savant uiconfig entity tables: {'CameraEntities': ['id', 'zoneID', 'name', 'componentName', 'logicalComponent', 'entityType', 'previewPath', 'fullscreenPath', 'previewURL', 'fullscreenURL', 'highSourceURL', 'lowSourceURL', 'highMulticastURL', 'lowMulticastURL', 'previewFormat', 'fullscreenFormat', 'highMulticastFormat', 'lowMulticastFormat', 'previewFramerate', 'fullscreenFramerate', 'previewStreamDecoder', 'fullscreenStreamDecoder', 'highMulticastStreamDecoder', 'lowMulticastStreamDecoder', 'hostname', 'username', 'password', 'cpassword', 'authentication', 'port', 'transport', 'partner', 'uriSource'], 'CameraRecorderEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'cloudRecording', 'keypressedEvent', 'motionEvent', 'noiseEvent', 'tamperEvent', 'mediaType', 'mediaStream', 'streamURL', 'username', 'password', 'authentication', 'partner'], 'DoorLockEntities': ['id', 'zoneID', 'name', 'entityType', 'addresses', 'lockCommand', 'unlockCommand', 'lockState', 'errorState', 'supportsStatus', 'supportsErrors', 'camera', 'partner', 'authentication'], 'EVChargerEntities': ['id', 'zoneID', 'name', 'ipAddress', 'address', 'startCommand', 'stopCommand', 'setRateCommand', 'linkedPM', 'linkedUID', 'linkedCircuitId', 'circuitId', 'chargerState', 'errorState', 'powerState', 'historyState', 'chargeRateState', 'chargeModeState', 'maxChargeRateState', 'minChargePowerState', 'maxChargePowerState', 'currentSessionEnergyState', 'currentSessionStartDateState', 'lastSessionEnergyState', 'lastSessionEndDateState', 'IsEVChargerConnectedState', 'IsEVChargerLinkedState', 'EVChargerScheduleState', 'partner', 'supportsErrors', 'supportsStatus', 'supportsRate'], 'EntryEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'serialNumber', 'securityCode', 'ringDuration', 'motionEvent', 'noiseEvent', 'tamperEvent', 'audioInterrupt', 'buttonConfiguration', 'authentication', 'partner', 'hasMotion', 'hasNoise', 'hasTamper', 'hasKeyPressed', 'chime'], 'FanEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'roomLightsControl', 'orderValue', 'isSceneable'], 'GarageEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'toggleCommand', 'openCommand', 'stopCommand', 'closeCommand', 'openState', 'errorState', 'supportsErrors', 'supportsStatus', 'supportsStop', 'camera'], 'HVACEntities': ['id', 'zoneID', 'name', 'addresses', 'temperatureSetPoints', 'heat', 'cool', 'auto', 'humiditySetPoints', 'humidify', 'dehumidify', 'hasExternalTempSensor', 'history', 'stateName', 'tempMinRange', 'tempMaxRange', 'tempBuffer', 'isCelsius', 'homeAway', 'authentication', 'partner'], 'HotWaterHeaterEntities': ['id', 'zoneID', 'name', 'address', 'setTempCommand', 'setCapacityCommand', 'setModeCommand', 'currentSetPointState', 'currentCapacityState', 'currentModeState', 'currentTempState', 'timeToSetPointState', 'hotWaterRemainState', 'partner', 'supportsErrors'], 'LightEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'entitySubType', 'technology', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'lightsAreOn', 'roomLightsControl', 'orderValue', 'isSceneable', 'naturalLightCapable', 'trueImageSupport', 'bleNetworkKey', 'bleGroupID', 'bleNodeID', 'isSavantLoad'], 'PoolAndSpaEntities': ['id', 'zoneID', 'name', 'entityType', 'auxiliaryNumber'], 'RemoteControlEntities': ['id', 'componentName', 'logicalComponent', 'zoneID', 'entityType', 'uid', 'buttonConfiguration'], 'SecuritySystemEntities': ['id', 'zoneID', 'name', 'componentName', 'entityType', 'partitionNumber', 'zoneNumber', 'hasBypass', 'hasLCDFeedback', 'statusState', 'bypassToggleState', 'bypassTextState', 'buttonAssignments', 'keypadLabels', 'smartPinConfig', 'emergencyLabels', 'partner'], 'ShadeEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'presetNumber', 'stateName', 'sceneNumber', 'orderValue', 'isSceneable']}
+2026-10-16 09:16:30.287 INFO (MainThread) [custom_components.savant_ha] Savant uiconfig parsed 189 device(s): {'climate': 13, 'light': 100, 'cover': 19, 'media_player': 57}
+2026-10-16 09:16:30.290 INFO (MainThread) [custom_components.savant_ha] Savant probe: authorized=True auth_response=True rooms=1 hvac=0 zones=0 devices=189
+2026-10-16 09:16:30.293 DEBUG (MainThread) [custom_components.savant_ha] Savant import suggested 0 possible Lutron duplicate light(s)
+2026-10-16 09:16:31.779 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 09:16:42.196 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))"
+1792169427569,2026-10-16T16:50:27.569Z,,,commit and push
+1792177476849,2026-10-16T19:04:36.849Z,,Fix Lutron name alias matching and diagnose exclusions,"The detection of Lutron lights doesn't seem to be working right 2026-10-16 12:03:09.478 DEBUG (MainThread) [custom_components.savant_ha] Savant discovery: 1 control reply(ies)
+2026-10-16 12:03:09.482 INFO (MainThread) [custom_components.savant_ha] Savant probe: connecting to collect devices
+2026-10-16 12:03:09.496 INFO (MainThread) [custom_components.savant_ha] Savant TLS version=TLSv1.3 cipher=('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+2026-10-16 12:03:09.497 INFO (MainThread) [custom_components.savant_ha] Savant WS connected to <HOST_IP>:51616 (subprotocol=rpm-protocol, aiohttp=3.14.4)
+2026-10-16 12:03:09.497 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/devicePresent (1 message(s))
+2026-10-16 12:03:09.504 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/deviceRecognized (1 message(s))
+2026-10-16 12:03:09.505 INFO (MainThread) [custom_components.savant_ha] Savant deviceRecognized (authentication=True)
+2026-10-16 12:03:09.601 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/authenticationRequest (1 message(s))
+2026-10-16 12:03:09.609 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/authenticationResponse (1 message(s))
+2026-10-16 12:03:09.609 INFO (MainThread) [custom_components.savant_ha] Savant login successful
+2026-10-16 12:03:09.612 DEBUG (MainThread) [custom_components.savant_ha] Savant <- featureLock (1 message(s))
+2026-10-16 12:03:09.612 DEBUG (MainThread) [custom_components.savant_ha] Savant featureLock: [{'TrueImageUnlock': {'state': 'unconfigured', 'capacityAvailable': 0, 'controllersUnlocked': 0}}]
+2026-10-16 12:03:09.704 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-16 12:03:09.799 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (1 message(s))
+2026-10-16 12:03:09.801 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=RecentServices
+2026-10-16 12:03:09.801 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (1 message(s))
+2026-10-16 12:03:09.803 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=scenesAndFoldersReduced
+2026-10-16 12:03:09.804 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1 message(s))
+2026-10-16 12:03:09.806 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:03:09.807 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:03:09.809 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:03:09.811 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (86 message(s))
+2026-10-16 12:03:09.813 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dcm/request (1 message(s))
+2026-10-16 12:03:09.815 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:03:09.816 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:03:09.819 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 12:03:09.819 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=1
+2026-10-16 12:03:09.820 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 12:03:09.823 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:09.823 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:09.826 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 12:03:09.827 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:09.828 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:09.833 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:09.833 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:09.836 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:09.836 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:10.047 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 12:03:10.356 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:10.356 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:10.359 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:10.359 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:10.361 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 12:03:10.362 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=1
+2026-10-16 12:03:10.362 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 12:03:10.370 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:10.371 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:10.373 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:03:10.374 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:03:29.596 DEBUG (MainThread) [custom_components.savant_ha] Savant uiconfig entity tables: {'CameraEntities': ['id', 'zoneID', 'name', 'componentName', 'logicalComponent', 'entityType', 'previewPath', 'fullscreenPath', 'previewURL', 'fullscreenURL', 'highSourceURL', 'lowSourceURL', 'highMulticastURL', 'lowMulticastURL', 'previewFormat', 'fullscreenFormat', 'highMulticastFormat', 'lowMulticastFormat', 'previewFramerate', 'fullscreenFramerate', 'previewStreamDecoder', 'fullscreenStreamDecoder', 'highMulticastStreamDecoder', 'lowMulticastStreamDecoder', 'hostname', 'username', 'password', 'cpassword', 'authentication', 'port', 'transport', 'partner', 'uriSource'], 'CameraRecorderEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'cloudRecording', 'keypressedEvent', 'motionEvent', 'noiseEvent', 'tamperEvent', 'mediaType', 'mediaStream', 'streamURL', 'username', 'password', 'authentication', 'partner'], 'DoorLockEntities': ['id', 'zoneID', 'name', 'entityType', 'addresses', 'lockCommand', 'unlockCommand', 'lockState', 'errorState', 'supportsStatus', 'supportsErrors', 'camera', 'partner', 'authentication'], 'EVChargerEntities': ['id', 'zoneID', 'name', 'ipAddress', 'address', 'startCommand', 'stopCommand', 'setRateCommand', 'linkedPM', 'linkedUID', 'linkedCircuitId', 'circuitId', 'chargerState', 'errorState', 'powerState', 'historyState', 'chargeRateState', 'chargeModeState', 'maxChargeRateState', 'minChargePowerState', 'maxChargePowerState', 'currentSessionEnergyState', 'currentSessionStartDateState', 'lastSessionEnergyState', 'lastSessionEndDateState', 'IsEVChargerConnectedState', 'IsEVChargerLinkedState', 'EVChargerScheduleState', 'partner', 'supportsErrors', 'supportsStatus', 'supportsRate'], 'EntryEntities': ['id', 'zoneID', 'name', 'entityType', 'componentName', 'logicalComponent', 'IP', 'serialNumber', 'securityCode', 'ringDuration', 'motionEvent', 'noiseEvent', 'tamperEvent', 'audioInterrupt', 'buttonConfiguration', 'authentication', 'partner', 'hasMotion', 'hasNoise', 'hasTamper', 'hasKeyPressed', 'chime'], 'FanEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'roomLightsControl', 'orderValue', 'isSceneable'], 'GarageEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'toggleCommand', 'openCommand', 'stopCommand', 'closeCommand', 'openState', 'errorState', 'supportsErrors', 'supportsStatus', 'supportsStop', 'camera'], 'HVACEntities': ['id', 'zoneID', 'name', 'addresses', 'temperatureSetPoints', 'heat', 'cool', 'auto', 'humiditySetPoints', 'humidify', 'dehumidify', 'hasExternalTempSensor', 'history', 'stateName', 'tempMinRange', 'tempMaxRange', 'tempBuffer', 'isCelsius', 'homeAway', 'authentication', 'partner'], 'HotWaterHeaterEntities': ['id', 'zoneID', 'name', 'address', 'setTempCommand', 'setCapacityCommand', 'setModeCommand', 'currentSetPointState', 'currentCapacityState', 'currentModeState', 'currentTempState', 'timeToSetPointState', 'hotWaterRemainState', 'partner', 'supportsErrors'], 'LightEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'entitySubType', 'technology', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'stateName', 'lightsAreOn', 'roomLightsControl', 'orderValue', 'isSceneable', 'naturalLightCapable', 'trueImageSupport', 'bleNetworkKey', 'bleGroupID', 'bleNodeID', 'isSavantLoad'], 'PoolAndSpaEntities': ['id', 'zoneID', 'name', 'entityType', 'auxiliaryNumber'], 'RemoteControlEntities': ['id', 'componentName', 'logicalComponent', 'zoneID', 'entityType', 'uid', 'buttonConfiguration'], 'SecuritySystemEntities': ['id', 'zoneID', 'name', 'componentName', 'entityType', 'partitionNumber', 'zoneNumber', 'hasBypass', 'hasLCDFeedback', 'statusState', 'bypassToggleState', 'bypassTextState', 'buttonAssignments', 'keypadLabels', 'smartPinConfig', 'emergencyLabels', 'partner'], 'ShadeEntities': ['id', 'zoneID', 'name', 'addresses', 'entityType', 'pressCommand', 'holdCommand', 'releaseCommand', 'togglePressCommand', 'toggleHoldCommand', 'toggleReleaseCommand', 'dimmerCommand', 'fadeTime', 'delayTime', 'presetNumber', 'stateName', 'sceneNumber', 'orderValue', 'isSceneable']}
+2026-10-16 12:03:30.007 INFO (MainThread) [custom_components.savant_ha] Savant uiconfig parsed 494 device(s): {'climate': 24, 'light': 201, 'cover': 79, 'media_player': 190}
+2026-10-16 12:03:30.012 INFO (MainThread) [custom_components.savant_ha] Savant probe: authorized=True auth_response=True rooms=1 hvac=0 zones=0 devices=494
+2026-10-16 12:03:30.092 DEBUG (MainThread) [custom_components.savant_ha] Savant import suggested 0 possible Lutron duplicate light(s)"
+1792177984317,2026-10-16T19:13:04.317Z,,,commit and push
+1792178307215,2026-10-16T19:18:27.215Z,,Investigate scene context after separate registrations fail,"2026-10-16 12:16:50.406 INFO (MainThread) [custom_components.savant_ha] Savant host connected
+2026-10-16 12:16:50.406 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/devicePresent (1 message(s))
+2026-10-16 12:16:50.567 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/deviceRecognized (1 message(s))
+2026-10-16 12:16:50.568 INFO (MainThread) [custom_components.savant_ha] Savant deviceRecognized (authentication=True)
+2026-10-16 12:16:50.667 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/authenticationRequest (1 message(s))
+2026-10-16 12:16:50.675 DEBUG (MainThread) [custom_components.savant_ha] Savant <- session/authenticationResponse (1 message(s))
+2026-10-16 12:16:50.675 INFO (MainThread) [custom_components.savant_ha] Savant login successful
+2026-10-16 12:16:50.675 INFO (MainThread) [custom_components.savant_ha] Savant discovered 1 new room(s)
+2026-10-16 12:16:50.679 DEBUG (MainThread) [custom_components.savant_ha] Savant <- featureLock (1 message(s))
+2026-10-16 12:16:50.679 DEBUG (MainThread) [custom_components.savant_ha] Savant featureLock: [{'TrueImageUnlock': {'state': 'unconfigured', 'capacityAvailable': 0, 'controllersUnlocked': 0}}]
+2026-10-16 12:16:50.680 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (21 message(s))
+2026-10-16 12:16:51.119 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (0 message(s))
+2026-10-16 12:16:51.119 DEBUG (MainThread) [custom_components.savant_ha] Savant -> session/fileDownload (1 message(s))
+2026-10-16 12:16:51.211 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (1 message(s))
+2026-10-16 12:16:51.213 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=RecentServices
+2026-10-16 12:16:51.213 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/dashboard/register (1 message(s))
+2026-10-16 12:16:51.216 DEBUG (MainThread) [custom_components.savant_ha] Savant scene subscription sent state=scenesAndFoldersReduced
+2026-10-16 12:16:51.216 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (1 message(s))
+2026-10-16 12:16:51.218 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:16:51.220 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:16:51.222 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:16:51.231 DEBUG (MainThread) [custom_components.savant_ha] Savant -> state/register (2896 message(s))
+2026-10-16 12:16:51.238 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dcm/request (1 message(s))
+2026-10-16 12:16:51.240 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:16:51.241 DEBUG (MainThread) [custom_components.savant_ha] Savant -> dis/userData/register (1 message(s))
+2026-10-16 12:16:51.246 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 12:16:51.246 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=1
+2026-10-16 12:16:51.247 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 12:16:51.248 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:51.249 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:51.253 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:51.253 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:51.259 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 12:16:51.261 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s)) 2026-10-16 12:16:52.511 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 12:16:52.513 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:52.514 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:52.516 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:52.517 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:52.521 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (764 message(s))
+2026-10-16 12:16:52.524 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.Audio Zone 1.refreshLMQ value='{""from"":""getRoot*"",""to"":""getRoot"",""time"":1792087460265916000}'
+2026-10-16 12:16:52.525 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.Audio Zone 1.refreshLMQ reason=no_local_waiter active_searches=0
+2026-10-16 12:16:52.526 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.Audio Zone 5.refreshLMQ value='{""from"":""getRoot*"",""to"":""getRoot"",""time"":1791155769937868000}'
+2026-10-16 12:16:52.526 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.Audio Zone 5.refreshLMQ reason=no_local_waiter active_searches=0
+2026-10-16 12:16:52.527 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.Audio Zone 1.refreshLMQ3 value='[{""from"":""getRoot"",""to"":""getRoot"",""time"":8},{""from"":""getRoot"",""to"":""getRoot"",""time"":0}]'
+2026-10-16 12:16:52.528 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.Audio Zone 1.refreshLMQ3 reason=no_local_waiter active_searches=0
+2026-10-16 12:16:52.528 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ value='{""from"":""getRoot*"",""to"":""getRoot"",""time"":1792087467395994000}'
+2026-10-16 12:16:52.529 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ reason=no_local_waiter active_searches=0
+2026-10-16 12:16:52.534 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.Audio Zone 5.refreshLMQ3 value='[{""from"":""getRoot"",""to"":""getRoot"",""time"":4}]'
+2026-10-16 12:16:52.534 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.Audio Zone 5.refreshLMQ3 reason=no_local_waiter active_searches=0
+2026-10-16 12:16:52.537 DEBUG (MainThread) [custom_components.savant_ha] Savant <- music search refresh state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ3 value='[{""from"":""getRoot"",""to"":""getRoot"",""time"":8},{""from"":""getRoot"",""to"":""getRoot"",""time"":0}]'
+2026-10-16 12:16:52.537 DEBUG (MainThread) [custom_components.savant_ha] Savant music search refresh ignored state=<PROJECT_NAME>.AVB Stream 5.refreshLMQ3 reason=no_local_waiter active_searches=0
+2026-10-16 12:16:53.049 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:53.049 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:53.051 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:53.051 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:53.054 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/dashboard/update (1 message(s))
+2026-10-16 12:16:53.055 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard scene candidate index=0 message_type=dict fields=[('state', 'str'), ('value', 'list')] state_present=True state=RecentServices value_type=list value_count=1
+2026-10-16 12:16:53.055 DEBUG (MainThread) [custom_components.savant_ha] Savant dashboard update has no scene inventory
+2026-10-16 12:16:53.059 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:53.059 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:16:53.062 DEBUG (MainThread) [custom_components.savant_ha] Savant <- dis/userData/update (1 message(s))
+2026-10-16 12:16:53.062 DEBUG (MainThread) [custom_components.savant_ha] Unhandled Savant URI 'dis/userData/update'
+2026-10-16 12:17:19.910 DEBUG (MainThread) [custom_components.savant_ha] Savant <- state/update (1 message(s))
+2026-10-16 12:17:34.984 DEBUG (MainThread) [custom_components.savant_ha] Savant discovery: 2 control reply(ies) 
+
+We're still not seeing scenes, unforch"
+1792178768565,2026-10-16T19:26:08.565Z,,Pause scenes and focus on Lutron deduplication,"Ok, let's hold off on the scenes until we can get better docs.  Let's focus on the lutron lights de-duplication"
+1792178895091,2026-10-16T19:28:15.091Z,,Clarify reconfigure action,"do you mean reconfigure rather than refresh?"
+1792179099024,2026-10-16T19:31:39.024Z,,Diagnose Lutron area and name mismatches,"2026-10-16 12:29:32.083 DEBUG (MainThread) [custom_components.savant_ha] Savant Lutron registry scan entries=1 enabled_entries=1 disabled_entries=0 registry_lights=214 eligible_lights=214 disabled_entities=0 disabled_devices=0 missing_area=0 missing_name=0
+2026-10-16 12:29:32.149 DEBUG (MainThread) [custom_components.savant_ha] Savant Lutron matching summary savant_lights=201 lutron_lights=214 missing_area=0 missing_name=0 no_matching_area=55 no_matching_name=146 ambiguous=0 suggested=0
+2026-10-16 12:29:32.150 DEBUG (MainThread) [custom_components.savant_ha] Savant import suggested 0 possible Lutron duplicate light(s)"
+1792179123745,2026-10-16T19:32:03.745Z,,Extend Lutron deduplication to covers,"we should also de-dupe shades (covers)"
+1792179173352,2026-10-16T19:32:53.352Z,,Print duplicate candidate names and areas at debug,"I think it's best if you print them to debug for now"
+1792179752077,2026-10-16T19:42:32.077Z,,,commit and push
+1792180206531,2026-10-16T19:50:06.531Z,,Inspect Lutron candidate comparison log,"check lutron.log for the results"
+1792180370210,2026-10-16T19:52:50.210Z,,Match cached Lutron load names and remove noisy logs,"Ok, let's implement those changes and disable the log printing for now.  It's very noisy"
+1792180675528,2026-10-16T19:57:55.528Z,,,commit and push
+1792181230423,2026-10-16T20:07:10.423Z,,Ask whether to exclude matched Lutron devices before picker,"It seems like they're matching now, but I don't see how they're ""unchecked""  They're still in the list and being inclided.  I'd like to see a pop-up before it loads the device list that asks whether lutron devices should be excluded or not and omit them from the list"
+1792181573820,2026-10-16T20:12:53.820Z,,,commit and push
+1792182492540,2026-10-16T20:28:12.540Z,,Fix blank Lutron menu choices,"the picker just has two empty choices...  a top one and a bottom one.  Theere's not explanatory text at all.  Which one do I choose?  There's also no alt text"
+1792182671222,2026-10-16T20:31:11.222Z,,,commit and push
+1792183527826,2026-10-16T20:45:27.826Z,,Replace blank coexistence menus with labeled forms,"they're still blank"
+1792185412542,2026-10-16T21:16:52.542Z,,,commit and push
+1793670377069,2026-11-03T01:46:17.070Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Project status question,Whats this project status
+1793684102601,2026-11-03T05:35:02.603Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Fix README install URL; compare upstream,"fix the README install URL
+
+Then compare with the upstream project (if still online) and another related GitHub projects for ideas we could merge in"
+"1790030000000","2026-09-21T22:33:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Read HANDOVER.md and AGENTS.md, then review PR 1 (step 1–5 of the plan) on the generic-av-endpoints branch. 
+
+Some more thoughts on my spec
+1) clean onboarding. I have many Savant endpoints, so the flow needs to be manageable. Does the Home Assistant HomeKit controller integration offer any ideas (e.g. pick domains, then list each item in each domain on a page, click to next)
+2) diagnostics - I will want some indicator of live integration health - options there? Is the system minute helper universal?"
+"1790032000000","2026-09-21T23:06:40.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","And yes I'm quite keen on ""what is the room's status""? tell us what source the study media is playing right now, from Savan'ts point of view. I will later corroborate this inhome assistant by looking at the underlying device state ourselves."
+"1790036880428","2026-09-22T00:28:00.428000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","onboarding - yep, homekit bridge style. 
+Maybe this is how we gracefully expand the scope from the few entities the owner built at first, into all my options
+
+
+yes on a healthcheck boolean somehow
+one diagnostic-category binary_sensor (device_class connectivity)
+
+An earlier probe showed this data. Unclear if CurrentMinute is specific to my host or universal
+
+avant host-local user: <LOCAL_USER>
+Password: 
+23:17:32.138 WSS connected <HOST_IP>:<PORT> subprotocol=rpm-protocol
+23:17:32.252 deviceRecognized: authentication=True authorized=False build=9.4.6 featureLevel=9 users=[]
+23:17:32.435 login authorized=True  startZone=None
+23:17:32.435 registered 2 key(s); watching 120s - press Savant buttons now
+23:17:32.440 <- featureLock (1 msg)
+23:17:32.465 UPDATE Living.ActiveService = ''
+23:17:32.483 UPDATE global.CurrentMinute = 17
+23:17:32.685 UPDATE global.CurrentMinute = 17
+23:17:32.685 UPDATE Living.ActiveService = ''
+23:18:00.466 UPDATE global.CurrentMinute = 18
+^CTraceback (most recent call last):
+  File ""<LOCAL_PATH>/cpython-3.12."
+"1790040200000","2026-09-22T01:23:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","found it, Savant AirPlay 2 is there, just a different name - and Hass is reflecting the Savant device reality.
+
+zones can be turned off independantly
+
+collapsing into one player might be a bridge too far for this integration. could be handled in my config as a template media player?
+
+lets start though with sensors which list state of each room"
+"1790041247824","2026-09-22T01:40:47.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","correct the zone source is there
+
+Now from memory Savant keeps track of both the video and audio state in each room. Can we bring all of that in as diagnostics? Check my savant-ha ssh sclibridge sensor array
+
+More state data the better. Savant 'asserts' status, based on what it last issues as commands. That's problematic since it doesn't always check vs. actual. ""master of the universe"". So, I will need Home Assistant to check it's thinking. (downstream, not in this integration. just maximise the sensors/diagnostics at this stage)"
+"1790042250206","2026-09-22T01:57:30.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","this stuff 
+
+Also ssh gave us more cli sensors ... are they in this protocol? 
+
+How does the streaming data/artwork come into this integraton? For the Savant streamer
+[screenshots: old sclibridge device sensors (device power/input/volume/mute), SSH host diagnostics (load/memory/boot), Savant IP Audio 125 streamer metadata via <HOST_IP>:9095/albumart, and per-zone sensors ActiveAudioService/ActiveService/ActiveVideoService/CurrentVolume/IsMuted/ZoneHasAudio/ZoneHasVideo/ZoneIsActive]"
+"1790053614535","2026-09-22T05:06:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Applied that, cycled a few inputs through Study, have a look
+
+[next message] dude you have an MCP for 1va hass
+
+[next message, with screenshot of Study room diagnostics showing Active audio/video/service = Apple TV (variant 1), Zone active/has audio/has video On, Foxtel->Apple TV transitions] Is there a way to make home assistant MCP available to ALL claude code sessions? I did have it at claude desktop level at some point, but you didn't like the functionality over there"
+"1790053674535","2026-09-22T05:07:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","what's the tip to make hass-mcp work at user scope config for claude code? You'll see it exists in a few different projects, such as homelab
+
+Then my next challenge would be: can we drive Savant AppleTV commands from Hass? Like DPAD and play/pause"
+"1790119933164","2026-09-22T23:32:13.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Can you assess the savant understood state right now? I am streaming from Music Assistant direct to the study amp - linkplay perhaps? I did not 'tell' Savant this would be happening. I also note on lovelace/savant-study that both Apple TV and Foxtel are 'on' ... that seems inconsistent within Savant. Also our own media player on that page doesn't render Study Amp in action ... is that since we picked the DLNA media player
+[screenshot: Savant Study view - Active service idle, Audio service Savant AirPlay 2, Zone active On, Apple TV/Foxtel/AirPlay 2 source tiles all On]"
+"1790146254695","2026-09-23T06:50:54.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Thanks, park that for a moment. First need to fix the doorbell actions. The classic savant doorbell.wav method isn't working, I presume it relied on my old ssh technique, which I disabled. THoughts on best approach now?  We could still have one-time ssh commands if we have no other options. Are their savant services/methods for us to discover or trigger through the UDP path"
+"1790165847659","2026-09-23T12:17:27.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","[trimmed to the savant_ha-relevant part] I'm going to keep using my fork, whether he takes PR1 or not.
+
+Where do I read the '10 line csv'
+
+I suppor the idea of uploading to my fork, and detailing 5 commits"
+"1790166191163","2026-09-23T12:23:11.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","Draft me a paragraph I can add to my first opened issue; pointing to my fork and those 5 ideas"
+"1790167340690","2026-09-23T12:42:20.000000Z","ses_savant_ha_cc_001","Generic AV endpoints PR 1","[trimmed to the savant_ha-relevant part] Posted https://github.com/hpux735/savant-ha/issues/1
+
+PS where is my CSV chat log in my repo"
+"1791434546238","2026-10-08T04:42:26.238000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] whats the error on savant_ha (in active development)"
+"1791436211535","2026-10-08T05:10:11.535000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] I dont see custom_components/savant_ha/services.yaml on my home assistant"
+"1791436521038","2026-10-08T05:15:21.038000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","savant_ha ... am I using my own custom version, or the live github repo? just checking before I copy that one file. bit odd to be missing just 1"
+"1791437076083","2026-10-08T05:24:36.083000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] copied services.yaml and restarted, verify
+
+push to git?"
+"1791455522893","2026-10-08T10:32:02.893000Z","ses_savant_ha_cc_002","HA 2026.10 sweep: services.yaml fix","[trimmed to the savant_ha-relevant part] trim the rows from anything not directly relevant to savant_ha
+
+No idea where he PLATFORMS trim came from 
+
+trim anything remotely PII/personal from CSV rows please"
+"1791456000000","2026-10-08T10:40:00.000000Z","flagged","Flagged changes","FLAGGED, NOT A PROMPT: custom_components/savant_ha/__init__.py PLATFORMS trimmed to MEDIA_PLAYER + REMOTE (BINARY_SENSOR, CLIMATE, COVER, FAN, LIGHT, SCENE, SENSOR commented out). Found as an uncommitted edit already running on the operator's HA (2026-09-29); no prompt in this CSV or in any session transcript, and the operator does not know its origin. Marked in source with '# NOTE: unprompted change — needs review'."
+1793684861156,2026-11-03T05:47:41.159Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Merge upstream + AV branch; domain chooser,"ok yes please bring up to date with hpux735/main, that's where my project was originally cloned from. 
+
+perhaps his media work duplicates some of mine? Check for conflicts before blindly merging
+
+for my personal situation it's likely only media entities that I want. I'd like a config flow that chooses which domains"
+1793684861157,2026-11-03T05:47:41.159Z,flagged,Flagged changes,"RESOLVED, NOT A PROMPT: the flagged media-only PLATFORMS trim in custom_components/savant_ha/__init__.py (row 2026-10-08 'Flagged changes') is removed. PLATFORMS is the full list again and the config-flow 'domains' step (prompt above: 'I'd like a config flow that chooses which domains') now selects the forwarded platforms per entry, so the '# NOTE: unprompted change' marker is gone."
+1793686170205,2026-11-03T06:09:30.208Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Room media players (option C),"Room based entities I think reflects the underlying Savant state data, so I wouldn't abandon it
+
+So lets go towards C. Might even be welcomed upstream if we do it right."
+1793686592334,2026-11-03T06:16:32.337Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,What to build next (question),What else should we build
+1793687006683,2026-11-03T06:23:26.685Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Live checker; assess v1b3verse,"build the live checker if you wish
+
+what does v1b3verse/savant accomplish? For my home use I don't care too much about the provenance stuff. but only if there's value in that project"

@@ -36,6 +36,7 @@ CONF_UID = "uid"  # generated stable client identifier
 CONF_NAME = "name"  # discovered host name
 CONF_ROOMS = "rooms"  # user-supplied room names (list[str])
 CONF_DEVICES = "devices"  # user-approved device list (list[dict]) from the picker step
+CONF_MEDIA_TOPOLOGY = "media_topology"  # complete archive media inventory for exact routing
 
 # Device kinds in the approved device list (mirror HA platform names).  Devices come
 # from the uiconfig.tar.gz config archive (PROTOCOL.md §13); each maps to one HA device
@@ -46,6 +47,64 @@ DEVICE_TYPE_COVER = "cover"
 DEVICE_TYPE_FAN = "fan"
 DEVICE_TYPE_LOCK = "lock"
 DEVICE_TYPE_MEDIA_PLAYER = "media_player"
+DEVICE_TYPE_ROOM = "room"
+
+# ---- Import domains (config-flow "domains" step) ----------------------------
+# Not protocol knowledge: a user-facing grouping of this integration's own HA
+# platforms, chosen at setup so a host can be imported for e.g. media only.
+CONF_DOMAINS = "domains"  # selected import groups (list[str]); absent = all (legacy)
+
+IMPORT_DOMAIN_MEDIA = "media_player"
+IMPORT_DOMAIN_LIGHT = "light"
+IMPORT_DOMAIN_CLIMATE = "climate"
+IMPORT_DOMAIN_COVER = "cover"
+IMPORT_DOMAIN_FAN = "fan"
+IMPORT_DOMAIN_SCENE = "scene"
+IMPORT_DOMAIN_DIAGNOSTICS = "diagnostics"
+
+# group -> (label, HA platform names, device-list types the group imports).
+# Scenes are not archive devices (they arrive as dashboard pushes), so the scene
+# group imports no device rows; diagnostics are the per-room/per-endpoint sensors.
+IMPORT_DOMAINS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    IMPORT_DOMAIN_MEDIA: (
+        "Media players and AV remotes", ("media_player", "remote"), (DEVICE_TYPE_MEDIA_PLAYER,)
+    ),
+    IMPORT_DOMAIN_LIGHT: ("Lights", ("light",), (DEVICE_TYPE_LIGHT,)),
+    IMPORT_DOMAIN_CLIMATE: ("Climate", ("climate",), (DEVICE_TYPE_CLIMATE,)),
+    IMPORT_DOMAIN_COVER: ("Shades and covers", ("cover",), (DEVICE_TYPE_COVER,)),
+    IMPORT_DOMAIN_FAN: ("Fans (read-only)", ("fan",), (DEVICE_TYPE_FAN,)),
+    IMPORT_DOMAIN_SCENE: ("Savant scenes", ("scene",), ()),
+    IMPORT_DOMAIN_DIAGNOSTICS: (
+        "Room and endpoint diagnostic sensors", ("sensor", "binary_sensor"), (DEVICE_TYPE_ROOM,)
+    ),
+}
+
+
+def selected_domains(data: dict[str, Any]) -> list[str]:
+    """Return the entry's import groups; entries created before the step get all."""
+    stored = data.get(CONF_DOMAINS)
+    if not stored:
+        return list(IMPORT_DOMAINS)
+    return [domain for domain in IMPORT_DOMAINS if domain in stored]
+
+
+def platforms_for_domains(domains: list[str]) -> list[str]:
+    """Return the HA platform names to forward for the selected import groups."""
+    platforms: list[str] = []
+    for domain in domains:
+        for platform in IMPORT_DOMAINS.get(domain, ("", (), ()))[1]:
+            if platform not in platforms:
+                platforms.append(platform)
+    return sorted(platforms)
+
+
+def device_types_for_domains(domains: list[str]) -> set[str]:
+    """Return the device-list ``type`` values the selected groups import."""
+    return {
+        device_type
+        for domain in domains
+        for device_type in IMPORT_DOMAINS.get(domain, ("", (), ()))[2]
+    }
 
 # ---- Protocol (PROTOCOL.md §1) --------------------------------------------
 # WebSocket subprotocol negotiated on the control channel.
@@ -110,6 +169,12 @@ VERB_PAUSE = "Pause"
 VERB_STOP_REPEAT = "StopRepeat"
 VERB_SKIP_UP = "SkipUp"
 VERB_SKIP_DOWN = "SkipDown"
+# Archive-declared by every SVC_AV_* type (PROTOCOL.md §5.4b); live-verified so far
+# only for SetVolume/PowerOn/PowerOff on SVC_AV_ENHANCEDDVD.
+VERB_MUTE_ON = "MuteOn"
+VERB_MUTE_OFF = "MuteOff"
+VERB_VOLUME_UP = "VolumeUp"
+VERB_VOLUME_DOWN = "VolumeDown"
 VERB_SEEK = "Seek"
 VERB_ROOM_BRIGHTNESS = "__RoomSetBrightness"
 VERB_DIMMER_SET = "DimmerSet"
@@ -150,6 +215,11 @@ ROOM_ATTRIBUTES = (
     "ActiveService",
     "ActiveServices",
     "LastActiveService",
+    "ZoneIsActive",  # 0/1, live-observed (PROTOCOL.md §5.4b).
+    # Live-observed as WSS pushes 2026-09-22 alongside ActiveService (PROTOCOL.md §5.4b).
+    "ActiveVideoService",
+    "ZoneHasAudio",
+    "ZoneHasVideo",
     "CurrentVolume",
     "IsMuted",
     "RelativeVolumeOnly",
@@ -208,6 +278,27 @@ def room_state_keys(rooms: set[str] | list[str]) -> list[str]:
         for attr in ROOM_ATTRIBUTES
         if attr != ROOM_CURRENT_TEMPERATURE
     ]
+
+# Device-level endpoint states pushed as ``<component>.<logicalComponent>.<attr>``
+# (PROTOCOL.md §5.4b, live-observed): IsPowered is 0/1, CurrentPowerStatus and
+# CurrentMuteStatus are "ON"/"OFF" strings, CurrentInput is the installer's input
+# label, CurrentVolume is a raw integer. Not every attribute exists on every
+# device class; unobserved keys simply never push.
+ENDPOINT_STATE_ATTRIBUTES = (
+    "IsPowered",
+    "CurrentPowerStatus",
+    "CurrentInput",
+    "CurrentVolume",
+    "CurrentMuteStatus",
+)
+
+
+def endpoint_state_keys(component: str, logical_component: str) -> list[str]:
+    """Return the device-level state keys for one AV endpoint component."""
+    return [
+        f"{component}.{logical_component}.{attr}" for attr in ENDPOINT_STATE_ATTRIBUTES
+    ]
+
 
 # Global attributes (PROTOCOL.md §5.4).
 GLOBAL_LIGHTS_ON = "global.LightsAreOn"

@@ -16,9 +16,16 @@
           "password": "Password"
         }
       },
+      "domains": {
+        "title": "Choose what to import",
+        "description": "Pick the kinds of Savant devices to bring into Home Assistant. Counts are devices found in the host's configuration. Only the chosen kinds are offered in the device picker and loaded at startup; you can change this later with Reconfigure.",
+        "data": {
+          "domains": "Import groups"
+        }
+      },
       "devices": {
         "title": "Savant devices found",
-        "description": "{count} device(s) found on {host}. Choose which to import. Each device is placed in its configured room as an area — you can move them later in Home Assistant.",
+        "description": "{count} device(s) available to import on {host}. Choose which to import. Devices excluded by your Lutron choice are omitted. Each imported device is placed in its configured room as an area — you can move it later in Home Assistant.",
         "data": {
           "devices": "Devices to import"
         }
@@ -26,9 +33,15 @@
       "coolmaster": {
         "title": "CoolMasterNet devices found",
         "description": "This Savant configuration includes CoolMasterNet climate devices. If Home Assistant can reach CoolMasterNet directly, install the built-in CoolMasterNet integration first; retrying Savant setup will exclude exact duplicate climate devices.",
-        "menu_options": {
-          "install_coolmaster": "Cancel and install CoolMasterNet first",
-          "continue_without_coolmaster": "Continue with Savant only"
+        "data": {
+          "coolmaster_action": "How should CoolMasterNet setup proceed?"
+        }
+      },
+      "lutron": {
+        "title": "Exclude matching Lutron devices?",
+        "description": "Found {count} Savant lights and shades that match existing Lutron Caséta/RA2 Select entities. Exclude these matches from the device picker and Savant import inventory, or include them if you want controls from both integrations. Your choice is saved only when you submit the final device picker. Direct Lutron entities are not changed.",
+        "data": {
+          "lutron_action": "How should matching Lutron devices be handled?"
         }
       },
       "reconfigure": {
@@ -41,7 +54,7 @@
       },
       "reconfigure_devices": {
         "title": "Savant devices found",
-        "description": "{count} device(s) found. Choose the refreshed inventory to import, including each media source.",
+        "description": "{count} device(s) available to import. Choose the refreshed inventory, including each media source. Devices excluded by your Lutron choice are omitted, even if previously imported. Changes are saved when you submit. Existing entity registry records are not automatically deleted.",
         "data": {
           "devices": "Devices to import"
         }
@@ -53,7 +66,9 @@
       "no_auth_response": "The host did not respond to the login request. The host may only accept local login from the Savant app (see PROTOCOL.md §4.6).",
       "cannot_connect": "Could not connect to the host on the discovered port.",
       "connection_refused": "The Savant host advertised a control port but refused the connection. It may be restarting; wait a moment and try again.",
-      "no_devices": "Connected and authenticated, but no rooms or devices were reported by the host."
+      "no_devices": "Connected and authenticated, but no rooms or devices were reported by the host.",
+      "invalid_choice": "Select one of the available choices.",
+      "no_domains": "Select at least one import group."
     },
     "abort": {
       "already_configured": "This host is already configured.",

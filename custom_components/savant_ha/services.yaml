@@ -1,0 +1,72 @@
+set_media_server_zones:
+  name: Set media server zones
+  description: Replace the complete selected endpoint set for one shared Savant media server.
+  fields:
+    entity_id:
+      name: Media server endpoint
+      description: A projected Savant media-player entity identifying the physical server.
+      required: true
+      selector:
+        entity:
+          integration: savant_ha
+          domain: media_player
+    zone_entity_ids:
+      name: Selected endpoints
+      description: The complete desired set of projected endpoints for the same server.
+      required: true
+      selector:
+        entity:
+          multiple: true
+          integration: savant_ha
+          domain: media_player
+
+service_request:
+  name: Send Savant service request
+  description: >-
+    Send a raw service/request to the Savant host over the authenticated
+    WebSocket. Exposes archive-declared services beyond the imported entities,
+    e.g. doorbell announcements (SVC_ENV_AV_DOORBELL AutoStartAIS per room) and
+    installer-authored SVC_GEN_GENERIC macros. The request is asserted by the
+    host without confirmation; watch state pushes for its effect.
+  fields:
+    service_type:
+      name: Service type
+      description: Savant service type, e.g. SVC_ENV_AV_DOORBELL
+      required: true
+      example: SVC_ENV_AV_DOORBELL
+      selector:
+        text:
+    request:
+      name: Request
+      description: Request verb, e.g. AutoStartAIS
+      required: true
+      example: AutoStartAIS
+      selector:
+        text:
+    zone:
+      name: Zone
+      description: Room name (empty for zoneless requests)
+      example: Formal Lounge
+      selector:
+        text:
+    component:
+      name: Component
+      description: Component name (empty mirrors the host CLI's doorbell usage)
+      selector:
+        text:
+    logical_component:
+      name: Logical component
+      description: Logical component (empty for none)
+      selector:
+        text:
+    variant_id:
+      name: Variant ID
+      description: Service variant (default 1)
+      default: "1"
+      selector:
+        text:
+    request_args:
+      name: Request arguments
+      description: 'Optional request arguments object, e.g. {"VolumeValue": 20}'
+      selector:
+        object:

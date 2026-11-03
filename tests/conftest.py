@@ -31,8 +31,11 @@ def _load(name: str, relpath: str) -> None:
 
 for _name, _rel in (
     ("custom_components.savant_ha.const", "const.py"),
+    ("custom_components.savant_ha.media_routing", "media_routing.py"),
+    ("custom_components.savant_ha.room_media", "room_media.py"),
     ("custom_components.savant_ha.control", "control.py"),
     ("custom_components.savant_ha.coolmaster", "coolmaster.py"),
+    ("custom_components.savant_ha.lutron", "lutron.py"),
     ("custom_components.savant_ha.uiconfig", "uiconfig.py"),
     ("custom_components.savant_ha.savant_client", "savant_client.py"),
 ):

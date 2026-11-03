@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .const import LOGGER
+from .media_routing import opaque_model_id
 
 # The member of the tar we care about.
 _SQLITE_MEMBER = "serviceImplementation.sqlite"
@@ -146,7 +147,16 @@ def _parse_connection(conn: sqlite3.Connection) -> list[SavantDevice]:
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
     ]
 
-    rooms = {row[0]: str(row[1] or "") for row in conn.execute("SELECT id, name FROM Rooms")}
+    room_cols = _table_columns(conn, "Rooms")
+    room_id_col = _pick(room_cols, ("roomID", "roomId", "room_id"))
+    room_select = f", {room_id_col}" if room_id_col else ""
+    room_rows = list(conn.execute(f"SELECT id, name{room_select} FROM Rooms"))
+    rooms = {row[0]: str(row[1] or "") for row in room_rows}
+    room_ids = {
+        str(row[1] or ""): str(row[2] or "")
+        for row in room_rows
+        if len(row) > 2 and row[1] and row[2]
+    }
     zone_rooms: dict[Any, set[str]] = {}
     if "ZoneRoomMap" in tables:
         for zone_id, room_id in conn.execute("SELECT zoneID, roomID FROM ZoneRoomMap"):
@@ -280,7 +290,8 @@ def _parse_connection(conn: sqlite3.Connection) -> list[SavantDevice]:
                 )
             )
 
-    _parse_media_zones(conn, tables, devices)
+    _parse_media_zones(conn, tables, devices, room_ids)
+    _parse_room_capabilities(conn, tables, rooms, devices)
     return devices
 
 
@@ -295,6 +306,7 @@ def _parse_media_zones(
     conn: sqlite3.Connection,
     tables: list[str],
     devices: list[SavantDevice],
+    room_ids: dict[str, str],
 ) -> None:
     # ServiceImplementationZonedService contains the canonical (pathOrder=0) endpoint
     # for every selectable music source. ServiceResources also contains intermediate
@@ -316,14 +328,14 @@ def _parse_media_zones(
     service_col = _pick(cols, ("service", "serviceID", "service_id"))
     variant_col = _pick(cols, ("serviceVariantID", "serviceVariantId", "variantID"))
     requests = _service_requests(conn, tables)
+    component_ids = _media_component_ids(conn, tables)
     seen: set[str | tuple[str, str, str]] = set()
+    media_start = len(devices)
     cursor = conn.execute(f'SELECT * FROM "{source}"')
     for row in cursor:
         d = _row_to_dict(cursor, row)
         service_type = str(d.get(svc_col) or "")
-        if service_type != "SVC_AV_SAVANTMUSIC" and not service_type.startswith(
-            "SVC_AV_APPLEREMOTEMEDIASERVER"
-        ):
+        if not _is_media_service(service_type, requests.get(str(d.get("id")), [])):
             continue
         if source == sir and path_order_col and str(d.get(path_order_col)) != "0":
             continue
@@ -351,9 +363,138 @@ def _parse_media_zones(
                     "service_type": service_type,
                     "variant_id": str(d.get(variant_col) or "1") if variant_col else "1",
                     "requests": requests.get(str(d.get("id")), []),
+                    # ZoneConfigComponents and Rooms provide opaque model identifiers.
+                    # Fall back to hashes of exact model keys for older/minimal archives.
+                    "media_server_id": component_ids.get(component)
+                    or opaque_model_id("server", component, service_type),
+                    "zone_id": opaque_model_id("zone", room_ids.get(room) or room),
                 },
             )
         )
+    _disambiguate_media_names(devices[media_start:])
+
+
+# RoomCapabilities flags with a captured room-state surface (PROTOCOL.md §5.2);
+# flags such as hasSecurity/hasCameras have no captured `<room>.*` keys yet.
+_ROOM_CAPABILITY_FLAGS = ("hasAV", "hasLights", "hasFans", "hasShades", "hasVariableShades")
+
+
+def _parse_room_capabilities(
+    conn: sqlite3.Connection,
+    tables: list[str],
+    rooms: dict[Any, str],
+    devices: list[SavantDevice],
+) -> None:
+    """Emit one ``room`` device per physical room with a usable capability.
+
+    ``RoomCapabilities`` marks what each room contains (hasAV, hasLights, ...).
+    Rooms with none of the captured-state capabilities (scene/event containers
+    such as alarm events) are skipped. The flags drive which per-room diagnostic
+    sensors the sensor platforms create.
+    """
+    table = "RoomCapabilities"
+    if table not in tables:
+        return
+    cols = _table_columns(conn, table)
+    room_col = _pick(cols, ("roomID", "roomId", "room_id"))
+    if not room_col:
+        return
+    flag_cols = {flag: col for flag in _ROOM_CAPABILITY_FLAGS if (col := _pick(cols, (flag,)))}
+    if not flag_cols:
+        return
+    cursor = conn.execute(f'SELECT * FROM "{table}"')
+    for row in cursor:
+        d = _row_to_dict(cursor, row)
+        room = rooms.get(d.get(room_col))
+        if not room:
+            continue
+        capabilities = {flag: bool(d.get(col)) for flag, col in flag_cols.items()}
+        if not any(capabilities.values()):
+            continue
+        devices.append(
+            SavantDevice(
+                device_type="room",
+                name=room,
+                room=room,
+                entity_id=f"room:{d.get(room_col)}",
+                extra={"capabilities": capabilities},
+            )
+        )
+
+
+def _is_media_service(service_type: str, declared_requests: list[str]) -> bool:
+    """Whether a zoned service should become a media_player entity.
+
+    Savant Music and Apple TV are admitted unconditionally (the original import
+    surface — keeps their entities and unique IDs stable on hosts whose archives
+    do not map requests for them). Any other ``SVC_AV_*`` endpoint is admitted
+    when its archive request map declares both PowerOn and PowerOff, the minimal
+    surface a media_player can represent (PROTOCOL.md §5.4b).
+    """
+    if service_type == "SVC_AV_SAVANTMUSIC" or service_type.startswith(
+        "SVC_AV_APPLEREMOTEMEDIASERVER"
+    ):
+        return True
+    if not service_type.startswith("SVC_AV_"):
+        return False
+    return "PowerOn" in declared_requests and "PowerOff" in declared_requests
+
+
+def _disambiguate_media_names(media: list[SavantDevice]) -> None:
+    """Suffix the service variant when one room shows the same name twice.
+
+    The same source can appear in a room once per speaker-configuration variant
+    (``serviceVariantID``); aliases usually differ, but when they do not the
+    variant number is the only distinguishing archive field (PROTOCOL.md §5.4b).
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for device in media:
+        key = (device.room, device.name)
+        counts[key] = counts.get(key, 0) + 1
+    for device in media:
+        if counts[(device.room, device.name)] > 1:
+            device.name = f"{device.name} (variant {device.extra.get('variant_id', '1')})"
+
+
+def _media_component_ids(conn: sqlite3.Connection, tables: list[str]) -> dict[str, str]:
+    """Map protocol component identifiers to physical component identifiers.
+
+    ``ZoneConfigComponents`` is the archive's physical component-to-zone table
+    (sibling PROTOCOL.md §13.1). A component can have several zone rows, so use a
+    field only when every nonempty row agrees on one identifier.
+    """
+    table = "ZoneConfigComponents"
+    if table not in tables:
+        return {}
+    cols = _table_columns(conn, table)
+    component_col = _pick(cols, ("component",))
+    if component_col is None:
+        return {}
+    identifier_cols = [
+        column
+        for candidates in (("uid",), ("componentID",), ("internalID",))
+        if (column := _pick(cols, candidates)) is not None
+    ]
+    if not identifier_cols:
+        return {}
+    values: dict[str, list[set[str]]] = {}
+    cursor = conn.execute(
+        f'''SELECT "{component_col}", {", ".join(f'"{column}"' for column in identifier_cols)}
+        FROM "{table}"'''
+    )
+    for row in cursor:
+        component = str(row[0] or "")
+        if not component:
+            continue
+        fields = values.setdefault(component, [set() for _ in identifier_cols])
+        for identifiers, value in zip(fields, row[1:], strict=True):
+            if value not in (None, ""):
+                identifiers.add(str(value))
+    result: dict[str, str] = {}
+    for component, fields in values.items():
+        if identifier := next((next(iter(field)) for field in fields if len(field) == 1), None):
+            result[component] = opaque_model_id("server", identifier)
+    return result
 
 
 def _service_requests(conn: sqlite3.Connection, tables: list[str]) -> dict[str, list[str]]:
@@ -367,18 +508,31 @@ def _service_requests(conn: sqlite3.Connection, tables: list[str]) -> dict[str, 
     endpoint_col = _pick(map_cols, ("ServiceImplementationZonedService_id",))
     request_id_col = _pick(map_cols, ("ServiceImplementationRequests_id",))
     request_name_col = _pick(request_cols, ("request",))
+    custom_col = _pick(request_cols, ("isCustom", "is_custom"))
     if not (endpoint_col and request_id_col and request_name_col):
         return {}
+    custom_select = f', r."{custom_col}"' if custom_col else ", 0"
     try:
         cursor = conn.execute(
-            f'''SELECT m."{endpoint_col}", r."{request_name_col}"
+            f'''SELECT m."{endpoint_col}", r."{request_name_col}"{custom_select}
             FROM "{request_map}" m
             JOIN "{requests}" r ON r.id = m."{request_id_col}"'''
         )
     except sqlite3.Error:
         return {}
     result: dict[str, list[str]] = {}
-    for endpoint_id, request in cursor:
-        if request:
-            result.setdefault(str(endpoint_id), []).append(str(request))
+    for endpoint_id, request, is_custom in cursor:
+        if not request:
+            continue
+        # ``isCustom=1`` marks installer-authored requests (scenes, macros); they are
+        # not part of the service's own control surface (PROTOCOL.md §5.4b).
+        if is_custom:
+            continue
+        # ASSUMPTION: ``<Component>_PowerToggle``/``SourcePowerToggle`` are Savant-
+        # generated per-device toggles (active→active), not a media_player power
+        # feature; suffix match is the only identifying pattern observed
+        # (PROTOCOL.md §7, open question).
+        if str(request).endswith("PowerToggle"):
+            continue
+        result.setdefault(str(endpoint_id), []).append(str(request))
     return result

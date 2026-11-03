@@ -1,19 +1,22 @@
 """Config flow for the Savant integration.
 
-Three steps, matching the standard device-import UX:
+Four steps, matching the standard device-import UX:
 
 1. **user** / **zeroconf** — UDP discovery resolves the host's stable ``UID`` and
    current control endpoint. mDNS discoveries skip the address prompt.
 2. **login** — the host-local account (``{user, password}``, PROTOCOL.md §4.1). The
    integration connects, authenticates, downloads the config archive, and enumerates
    the device inventory (PROTOCOL.md §13).
-3. **devices** — the collected devices (lights / thermostats / shades / fans / AV
+3. **domains** — which import groups (media players, lights, climate, …) to bring
+   in; the remaining steps and the forwarded platforms follow this choice.
+4. **devices** — the collected devices (lights / thermostats / shades / fans / AV
    zones / …), each with an area override. On accept, the entry is created with the
    approved device list.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 import aiohttp
@@ -23,6 +26,7 @@ from homeassistant.config_entries import ConfigEntry, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
@@ -31,18 +35,25 @@ from .const import (
     CONF_CLOUD_TOKEN,
     CONF_CONFIGURATION_ID,
     CONF_DEVICES,
+    CONF_DOMAINS,
     CONF_HOME_ID,
     CONF_HOST_TOKEN,
     CONF_HOST_UID,
+    CONF_MEDIA_TOPOLOGY,
     CONF_NAME,
     CONF_ROOMS,
     DEVICE_TYPE_CLIMATE,
     DEVICE_TYPE_LIGHT,
     DEVICE_TYPE_MEDIA_PLAYER,
     DOMAIN,
+    IMPORT_DOMAIN_SCENE,
+    IMPORT_DOMAINS,
     LOGGER,
+    device_types_for_domains,
+    selected_domains,
 )
 from .coolmaster import exclude_duplicate_coolmaster_devices, is_coolmaster_climate
+from .lutron import find_duplicate_lutron_devices
 from .savant_client import (
     SavantDeviceInfo,
     SavantHostInfo,
@@ -142,10 +153,14 @@ def _device_label(device: dict[str, Any]) -> str:
 
 
 def _devices_schema(devices: list[dict[str, Any]]) -> vol.Schema:
-    # A multi-select of device names (proper labels), defaulting to all selected.  The
-    # device's area is its room from the config archive (looked up, not typed).
+    if not devices:
+        return vol.Schema({})
     options = [
-        {"value": device["id"], "label": _device_label(device)} for device in devices
+        {
+            "value": device["id"],
+            "label": _device_label(device),
+        }
+        for device in devices
     ]
     return vol.Schema(
         {
@@ -175,6 +190,11 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._username: str = ""
         self._password: str = ""
         self._devices: list[dict[str, Any]] = []
+        self._all_devices: list[dict[str, Any]] = []
+        self._domains: list[str] | None = None
+        self._lutron_duplicates: dict[str, str] = {}
+        self._exclude_lutron: bool | None = None
+        self._media_topology: list[dict[str, Any]] | None = None
         self._reconfigure_entry: ConfigEntry | None = None
 
     async def async_step_user(
@@ -246,27 +266,11 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "invalid_auth" if probe.auth_response_seen else "no_auth_response"
                 )
             else:
-                self._devices = _devices_from_info(probe)
-                if self._coolmaster_entries():
-                    self._devices = exclude_duplicate_coolmaster_devices(
-                        self._devices, self._coolmaster_climate_names()
-                    )
-                elif any(is_coolmaster_climate(device) for device in self._devices):
-                    return self.async_show_menu(
-                        step_id="coolmaster",
-                        menu_options=["install_coolmaster", "continue_without_coolmaster"],
-                    )
-                if not self._devices:
+                self._set_inventory(_devices_from_info(probe), bool(probe.devices))
+                if not self._all_devices:
                     errors["base"] = "no_devices"
                 else:
-                    return self.async_show_form(
-                        step_id="devices",
-                        data_schema=_devices_schema(self._devices),
-                        description_placeholders={
-                            "count": str(len(self._devices)),
-                            "host": self._host,
-                        },
-                    )
+                    return await self.async_step_domains()
 
         return self.async_show_form(
             step_id="login",
@@ -275,47 +279,185 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"host": self._host, "name": self._name or self._host},
         )
 
-    async def async_step_install_coolmaster(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Stop setup so the installer can configure direct CoolMasterNet access."""
-        return self.async_abort(reason="coolmaster_setup_recommended")
-
-    async def async_step_continue_without_coolmaster(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Continue with the Savant device picker when direct access is unavailable."""
-        return self.async_show_form(
-            step_id="devices",
-            data_schema=_devices_schema(self._devices),
-            description_placeholders={"count": str(len(self._devices)), "host": self._host},
+    def _set_inventory(self, devices: list[dict[str, Any]], from_archive: bool) -> None:
+        """Hold the host's full inventory until the domains step filters it."""
+        self._all_devices = devices
+        self._devices = list(devices)
+        self._lutron_duplicates = {}
+        self._exclude_lutron = None
+        # Routing needs every archive media endpoint, whatever the user imports.
+        self._media_topology = (
+            [dict(device) for device in devices if device["type"] == DEVICE_TYPE_MEDIA_PLAYER]
+            if from_archive
+            else None
         )
+
+    def _available_domains(self) -> dict[str, int]:
+        """Import groups offered for this inventory, with their device counts.
+
+        Scenes are always offered: they arrive as dashboard pushes after setup, so
+        the archive inventory cannot say whether the host has any.
+        """
+        counts: dict[str, int] = {}
+        for domain, (_label, _platforms, device_types) in IMPORT_DOMAINS.items():
+            count = sum(1 for d in self._all_devices if d.get("type") in device_types)
+            if count or domain == IMPORT_DOMAIN_SCENE:
+                counts[domain] = count
+        return counts
+
+    def _domains_schema(self, available: dict[str, int], default: list[str]) -> vol.Schema:
+        options = [
+            {
+                "value": domain,
+                "label": IMPORT_DOMAINS[domain][0]
+                + ("" if domain == IMPORT_DOMAIN_SCENE else f" ({count})"),
+            }
+            for domain, count in available.items()
+        ]
+        return vol.Schema(
+            {
+                vol.Required(CONF_DOMAINS, default=default): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options, multiple=True, mode=selector.SelectSelectorMode.LIST
+                    )
+                )
+            }
+        )
+
+    async def async_step_domains(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Choose which import groups (HA domains) to bring in from this host."""
+        errors: dict[str, str] = {}
+        available = self._available_domains()
+        if user_input is not None:
+            requested = set(user_input.get(CONF_DOMAINS) or [])
+            chosen = [domain for domain in available if domain in requested]
+            if not chosen:
+                errors["base"] = "no_domains"
+            else:
+                self._domains = chosen
+                types = device_types_for_domains(chosen)
+                self._devices = [d for d in self._all_devices if d.get("type") in types]
+                self._lutron_duplicates = self._find_lutron_duplicates()
+                self._exclude_lutron = None
+                if self._coolmaster_entries():
+                    self._devices = exclude_duplicate_coolmaster_devices(
+                        self._devices, self._coolmaster_climate_names()
+                    )
+                elif self._reconfigure_entry is None and any(
+                    is_coolmaster_climate(device) for device in self._devices
+                ):
+                    return await self.async_step_coolmaster()
+                if not self._devices and IMPORT_DOMAIN_SCENE not in chosen:
+                    errors["base"] = "no_devices"
+                else:
+                    return await self._async_device_picker()
+
+        if self._reconfigure_entry is not None:
+            default = [
+                d for d in selected_domains(self._reconfigure_entry.data) if d in available
+            ]
+        else:
+            default = list(available)
+        return self.async_show_form(
+            step_id="domains",
+            data_schema=self._domains_schema(available, default or list(available)),
+            errors=errors,
+        )
+
+    async def async_step_coolmaster(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Offer direct CoolMasterNet setup before importing Savant climates."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            if user_input.get("coolmaster_action") == "install":
+                return self.async_abort(reason="coolmaster_setup_recommended")
+            if user_input.get("coolmaster_action") == "continue":
+                return await self.async_step_devices()
+            errors["base"] = "invalid_choice"
+        LOGGER.debug("Savant setup choice form step=coolmaster")
+        return self.async_show_form(
+            step_id="coolmaster",
+            data_schema=vol.Schema({
+                vol.Required("coolmaster_action"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        mode=selector.SelectSelectorMode.LIST,
+                        options=[
+                            {"value": "install", "label": "Cancel Savant setup so I can install CoolMasterNet first"},
+                            {"value": "continue", "label": "Continue Savant setup without direct CoolMasterNet"},
+                        ],
+                    )
+                ),
+            }),
+            errors=errors,
+        )
+
+    async def async_step_lutron(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Ask whether to omit matched Lutron lights and covers before the picker."""
+        count = len(self._lutron_duplicates)
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            action = user_input.get("lutron_action")
+            if action in ("exclude", "include"):
+                self._exclude_lutron = action == "exclude"
+                return await self._async_device_picker()
+            errors["base"] = "invalid_choice"
+        LOGGER.debug("Savant setup choice form step=lutron matches=%d", count)
+        return self.async_show_form(
+            step_id="lutron",
+            data_schema=vol.Schema({
+                vol.Required("lutron_action"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        mode=selector.SelectSelectorMode.LIST,
+                        options=[
+                            {"value": "exclude", "label": f"Exclude {count} matched Lutron lights/shades from the Savant device list"},
+                            {"value": "include", "label": f"Include {count} matched Lutron lights/shades in the Savant device list"},
+                        ],
+                    )
+                ),
+            }),
+            description_placeholders={"count": str(count)},
+            errors=errors,
+        )
+
+    async def _async_device_picker(self) -> FlowResult:
+        if self._reconfigure_entry is not None:
+            return await self.async_step_reconfigure_devices()
+        return await self.async_step_devices()
 
     async def async_step_devices(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
+        if self._lutron_duplicates and self._exclude_lutron is None:
+            return await self.async_step_lutron()
+        devices = self._devices_for_import()
         if user_input is not None:
             selected = set(user_input.get("devices", []))
             # area is the device's room, looked up from the config archive; it becomes
             # the HA area via the entity's suggested_area.
-            approved = [dict(d) for d in self._devices if d["id"] in selected]
+            approved = [dict(d) for d in devices if d["id"] in selected]
 
-            return self.async_create_entry(
-                title=self._name or self._host,
-                data={
-                    CONF_HOST_UID: self._host_uid,
-                    CONF_NAME: self._name,
-                    CONF_HOME_ID: self._home_id,
-                    CONF_USERNAME: self._username,
-                    CONF_PASSWORD: self._password,
-                    CONF_DEVICES: approved,
-                },
-            )
+            data = {
+                CONF_HOST_UID: self._host_uid,
+                CONF_NAME: self._name,
+                CONF_HOME_ID: self._home_id,
+                CONF_USERNAME: self._username,
+                CONF_PASSWORD: self._password,
+                CONF_DEVICES: approved,
+                CONF_DOMAINS: self._domains or list(IMPORT_DOMAINS),
+            }
+            if self._media_topology is not None:
+                data[CONF_MEDIA_TOPOLOGY] = self._media_topology
+            return self.async_create_entry(title=self._name or self._host, data=data)
 
         return self.async_show_form(
             step_id="devices",
-            data_schema=_devices_schema(self._devices),
-            description_placeholders={"count": str(len(self._devices)), "host": self._host},
+            data_schema=_devices_schema(devices),
+            description_placeholders={"count": str(len(devices)), "host": self._host},
         )
 
     async def async_step_reconfigure(
@@ -353,17 +495,9 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "invalid_auth" if probe.auth_response_seen else "no_auth_response"
                 )
             else:
-                self._devices = _devices_from_info(probe)
-                if self._coolmaster_entries():
-                    self._devices = exclude_duplicate_coolmaster_devices(
-                        self._devices, self._coolmaster_climate_names()
-                    )
-                if self._devices:
-                    return self.async_show_form(
-                        step_id="reconfigure_devices",
-                        data_schema=_devices_schema(self._devices),
-                        description_placeholders={"count": str(len(self._devices))},
-                    )
+                self._set_inventory(_devices_from_info(probe), bool(probe.devices))
+                if self._all_devices:
+                    return await self.async_step_domains()
                 errors["base"] = "no_devices"
 
         return self.async_show_form(
@@ -379,11 +513,14 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Persist a reconfigured, user-approved device inventory."""
+        if self._lutron_duplicates and self._exclude_lutron is None:
+            return await self.async_step_lutron()
+        devices = self._devices_for_import()
         if user_input is None:
             return self.async_show_form(
                 step_id="reconfigure_devices",
-                data_schema=_devices_schema(self._devices),
-                description_placeholders={"count": str(len(self._devices))},
+                data_schema=_devices_schema(devices),
+                description_placeholders={"count": str(len(devices))},
             )
         if self._reconfigure_entry is None:
             return self.async_abort(reason="reconfigure_failed")
@@ -393,9 +530,12 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             {
                 CONF_USERNAME: self._username,
                 CONF_PASSWORD: self._password,
-                CONF_DEVICES: [dict(d) for d in self._devices if d["id"] in selected],
+                CONF_DEVICES: [dict(d) for d in devices if d["id"] in selected],
+                CONF_DOMAINS: self._domains or selected_domains(self._reconfigure_entry.data),
             }
         )
+        if self._media_topology is not None:
+            data[CONF_MEDIA_TOPOLOGY] = self._media_topology
         self.hass.config_entries.async_update_entry(self._reconfigure_entry, data=data)
         return self.async_abort(reason="reconfigure_successful")
 
@@ -405,6 +545,99 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         except Exception:  # noqa: BLE001 - discovery is best-effort
             LOGGER.exception("Savant discovery failed for %s", host)
             return None
+
+    def _devices_for_import(self) -> list[dict[str, Any]]:
+        return [
+            device for device in self._devices
+            if not self._exclude_lutron or device["id"] not in self._lutron_duplicates
+        ]
+
+    def _find_lutron_duplicates(self) -> dict[str, str]:
+        """Inspect enabled Caseta/RA2 Select lights/covers without controlling them."""
+        entries = self.hass.config_entries.async_entries("lutron_caseta")
+        entity_registry = er.async_get(self.hass)
+        device_registry = dr.async_get(self.hass)
+        area_registry = ar.async_get(self.hass)
+        entities: list[dict[str, Any]] = []
+        counts: Counter[str] = Counter()
+        for entry in entries:
+            if entry.disabled_by is not None:
+                counts["disabled_entries"] += 1
+                continue
+            counts["enabled_entries"] += 1
+            source_names: dict[tuple[str, str], list[str]] = {}
+            runtime = getattr(entry, "runtime_data", None)
+            bridge = getattr(runtime, "bridge", None)
+            if bridge is not None:
+                # Mirror HA's lutron_caseta/entity.py unique_id and load-name rules.
+                # These are cached integration records, not a bridge/network request.
+                for domain in ("light", "cover"):
+                    for load in bridge.get_devices_by_domain(domain):
+                        name = load.get("name")
+                        if not isinstance(name, str):
+                            continue
+                        name = name.rsplit("_", 1)[-1]
+                        if not name.strip():
+                            continue
+                        serial = load.get("serial")
+                        if serial is not None:
+                            unique_id = str(serial)
+                        elif entry.unique_id and load.get("device_id") is not None:
+                            unique_id = f"{entry.unique_id}_{load['device_id']}"
+                        else:
+                            continue
+                        source_names.setdefault((domain, unique_id), []).append(name)
+            for entity in er.async_entries_for_config_entry(entity_registry, entry.entry_id):
+                domain = entity.entity_id.partition(".")[0]
+                if (
+                    entity.platform != "lutron_caseta"
+                    or domain not in {"light", "cover"}
+                ):
+                    continue
+                counts[f"registry_{domain}s"] += 1
+                if entity.disabled_by is not None:
+                    counts["disabled_entities"] += 1
+                    continue
+                device = device_registry.async_get(entity.device_id) if entity.device_id else None
+                if device is not None and device.disabled_by is not None:
+                    counts["disabled_devices"] += 1
+                    continue
+                area_id = entity.area_id or (device.area_id if device else None)
+                area = area_registry.async_get_area(area_id) if area_id else None
+                names = [entity.name, entity.original_name]
+                if device is not None:
+                    names.extend((device.name_by_user, device.name))
+                load_names = source_names.get((domain, entity.unique_id), [])
+                names.extend(load_names)
+                if load_names:
+                    counts["source_names"] += 1
+                names = [name for name in names if isinstance(name, str) and name.strip()]
+                if area is None:
+                    counts["missing_area"] += 1
+                    continue
+                if names:
+                    counts[f"eligible_{domain}s"] += 1
+                    entities.append({
+                        "entity_id": entity.entity_id,
+                        "names": names,
+                        "area": area.name,
+                    })
+                else:
+                    counts["missing_name"] += 1
+        LOGGER.debug(
+            "Savant Lutron registry scan entries=%d enabled_entries=%d disabled_entries=%d "
+            "registry_lights=%d eligible_lights=%d registry_covers=%d eligible_covers=%d "
+            "disabled_entities=%d disabled_devices=%d "
+            "missing_area=%d missing_name=%d source_names=%d",
+            len(entries), counts["enabled_entries"], counts["disabled_entries"],
+            counts["registry_lights"], counts["eligible_lights"],
+            counts["registry_covers"], counts["eligible_covers"], counts["disabled_entities"],
+            counts["disabled_devices"], counts["missing_area"], counts["missing_name"],
+            counts["source_names"],
+        )
+        matches = find_duplicate_lutron_devices(self._devices, entities)
+        LOGGER.debug("Savant import suggested %d possible Lutron duplicate device(s)", len(matches))
+        return matches
 
     def _coolmaster_entries(self) -> list[ConfigEntry]:
         """Return enabled built-in CoolMasterNet config entries."""

@@ -44,14 +44,30 @@ def _make_sqlite_bytes() -> bytes:
     )
     conn.execute(
         "CREATE TABLE ServiceImplementationRequests "
-        "(id INTEGER PRIMARY KEY, request TEXT)"
+        "(id INTEGER PRIMARY KEY, request TEXT, isCustom INTEGER)"
     )
     conn.execute(
         "CREATE TABLE ServiceImplementationRequestMap "
         "(id INTEGER PRIMARY KEY, ServiceImplementationZonedService_id INTEGER, "
         "ServiceImplementationRequests_id INTEGER)"
     )
+    conn.execute(
+        "CREATE TABLE ZoneConfigComponents "
+        "(id INTEGER PRIMARY KEY, component TEXT, zone TEXT, componentID TEXT, "
+        "uid TEXT, internalID TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE RoomCapabilities (id INTEGER PRIMARY KEY, roomID INTEGER,"
+        " hasAV INTEGER, hasLights INTEGER, hasFans INTEGER, hasShades INTEGER,"
+        " hasVariableShades INTEGER)"
+    )
     conn.execute("INSERT INTO Rooms VALUES (1,'Kitchen','r1'),(2,'Living Room','r2')")
+    conn.execute(
+        "INSERT INTO RoomCapabilities VALUES"
+        # Kitchen: AV + lights. Living Room: no capability flags -> a scene/event
+        # container, no room device. Row 3 references no known room.
+        " (1,1,1,1,0,0,0), (2,2,0,0,0,0,0), (3,99,1,1,1,1,1)"
+    )
     conn.execute(
         "INSERT INTO Zones VALUES (10,'Kitchen','Environmental',"
         "'SVC_ENV_LIGHTING','Host'),(11,'Kitchen','Environmental',"
@@ -97,15 +113,46 @@ def _make_sqlite_bytes() -> bytes:
         " (4,'Kitchen','Music','Audio Zone 1','SVC_AV_SAVANTMUSIC','Transport hop',"
         "'Kitchen-Living-Room-Sound-Bar-AVB-Stream-2','2','Transport hop',1),"
         " (5,'Kitchen','AppleTV1','Media_server','SVC_AV_APPLEREMOTEMEDIASERVER',"
-        "'AppleTV1 Control','Kitchen-AppleTV1-Media-server-1','1','AppleTV1 Control',0)"
+        "'AppleTV1 Control','Kitchen-AppleTV1-Media-server-1','1','AppleTV1 Control',0),"
+        " (6,'Living Room','Music','Audio Zone 2','SVC_AV_SAVANTMUSIC','Music',"
+        "'Living-Room-Music-Audio-Zone-2','1','Music',0),"
+        # Generic AV endpoint: declares PowerOn/PowerOff so it is imported; its
+        # installer-custom and PowerToggle requests must be filtered out.
+        " (7,'Kitchen','Blu ray','Bluray Player','SVC_AV_ENHANCEDDVD','Blu-ray',"
+        "'Kitchen-Blu ray-Bluray Player-1-SVC_AV_ENHANCEDDVD','1','Blu-ray',0),"
+        # Generic AV endpoint without PowerOn/PowerOff: not imported.
+        " (8,'Kitchen','Camera Hub','Video Source','SVC_AV_HDMI','Cameras',"
+        "'Kitchen-Camera Hub-Video Source-1-SVC_AV_HDMI','1','Cameras',0),"
+        # Two speaker-configuration variants sharing one alias in one room:
+        # names must be disambiguated by variant.
+        " (9,'Living Room','Amp','Amplifier','SVC_AV_GENERALAUDIO','Amp',"
+        "'Living Room-Amp-Amplifier-1-SVC_AV_GENERALAUDIO','1','Amp',0),"
+        " (10,'Living Room','Amp','Amplifier','SVC_AV_GENERALAUDIO','Amp',"
+        "'Living Room-Amp-Amplifier-3-SVC_AV_GENERALAUDIO','3','Amp',0)"
+    )
+    conn.execute(
+        "INSERT INTO ZoneConfigComponents VALUES"
+        " (1,'Music','Kitchen','music-component-id','music-server-uid','music-internal'),"
+        " (2,'Music','Living Room','music-component-id','music-server-uid','music-internal'),"
+        " (3,'Living Room Sound Bar','Kitchen','soundbar-component-id',"
+        "'soundbar-server-uid','soundbar-internal'),"
+        " (4,'AppleTV1','Kitchen','appletv-component-id','appletv-uid','appletv-internal')"
     )
     conn.execute(
         "INSERT INTO ServiceImplementationRequests VALUES"
-        " (1,'PowerOn'),(2,'PowerOff'),(3,'SetVolume'),(4,'Play'),(5,'Pause')"
+        " (1,'PowerOn',0),(2,'PowerOff',0),(3,'SetVolume',0),(4,'Play',0),(5,'Pause',0),"
+        " (6,'MuteOn',0),(7,'MuteOff',0),(8,'Bluray Player_PowerToggle',0),"
+        " (9,'Movie Night Scene',1),(10,'SourcePowerToggle',0)"
     )
     conn.execute(
         "INSERT INTO ServiceImplementationRequestMap VALUES"
-        " (1,5,1),(2,5,2),(3,5,3),(4,5,4),(5,5,5)"
+        " (1,5,1),(2,5,2),(3,5,3),(4,5,4),(5,5,5),"
+        # Blu-ray: full surface plus one custom and two PowerToggle rows to drop.
+        " (6,7,1),(7,7,2),(8,7,3),(9,7,6),(10,7,7),(11,7,8),(12,7,9),(13,7,10),"
+        # Camera hub: volume only — no PowerOn/PowerOff, so it stays unimported.
+        " (14,8,3),"
+        # Both amp variants declare power.
+        " (15,9,1),(16,9,2),(17,10,1),(18,10,2)"
     )
     data = conn.serialize()
     conn.close()
@@ -165,11 +212,76 @@ def test_parse_completed_archive_and_devices():
         ("Music", "Kitchen", "Music", "Audio Zone 1"),
         ("Living Room Sound Bar", "Kitchen", "Living Room Sound Bar", "AVB Stream 2"),
         ("AppleTV1 Control", "Kitchen", "AppleTV1", "Media_server"),
+        ("Music", "Living Room", "Music", "Audio Zone 2"),
+        ("Blu-ray", "Kitchen", "Blu ray", "Bluray Player"),
+        ("Amp (variant 1)", "Living Room", "Amp", "Amplifier"),
+        ("Amp (variant 3)", "Living Room", "Amp", "Amplifier"),
     ]
-    assert [d.extra["variant_id"] for d in media] == ["1", "2", "1"]
-    apple_tv = media[-1]
+    assert [d.extra["variant_id"] for d in media] == ["1", "2", "1", "1", "1", "1", "3"]
+    music = [d for d in media if d.component == "Music"]
+    assert len({d.extra["media_server_id"] for d in music}) == 1
+    assert all(d.extra["media_server_id"].startswith("server:") for d in music)
+    assert len({d.extra["zone_id"] for d in music}) == 2
+    assert all(d.extra["zone_id"].startswith("zone:") for d in music)
+    soundbar = next(d for d in media if d.component == "Living Room Sound Bar")
+    assert soundbar.extra["media_server_id"].startswith("server:")
+    assert soundbar.extra["media_server_id"] != music[0].extra["media_server_id"]
+    apple_tv = next(d for d in media if d.component == "AppleTV1")
     assert apple_tv.extra["service_type"] == "SVC_AV_APPLEREMOTEMEDIASERVER"
     assert apple_tv.extra["requests"] == ["PowerOn", "PowerOff", "SetVolume", "Play", "Pause"]
+    # The unimported HDMI endpoint lacks PowerOn/PowerOff.
+    assert all(d.component != "Camera Hub" for d in media)
+    bluray = next(d for d in media if d.component == "Blu ray")
+    assert bluray.extra["service_type"] == "SVC_AV_ENHANCEDDVD"
+    # Custom and *_PowerToggle requests are dropped; the control surface remains.
+    assert bluray.extra["requests"] == [
+        "PowerOn",
+        "PowerOff",
+        "SetVolume",
+        "MuteOn",
+        "MuteOff",
+    ]
+    assert bluray.extra["service_id"] == "Kitchen-Blu ray-Bluray Player-1-SVC_AV_ENHANCEDDVD"
+
+    rooms = [d for d in devices if d.device_type == "room"]
+    assert [(d.name, d.room, d.entity_id) for d in rooms] == [("Kitchen", "Kitchen", "room:1")]
+    assert rooms[0].extra["capabilities"] == {
+        "hasAV": True,
+        "hasLights": True,
+        "hasFans": False,
+        "hasShades": False,
+        "hasVariableShades": False,
+    }
+
+
+def test_media_topology_falls_back_to_opaque_model_ids():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE Rooms (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute(
+        "CREATE TABLE Zones (id INTEGER PRIMARY KEY, name TEXT, type TEXT, "
+        "serviceID TEXT, logicalComponent TEXT)"
+    )
+    conn.execute("INSERT INTO Rooms VALUES (1, 'Kitchen')")
+    conn.execute(
+        "CREATE TABLE ServiceImplementationServiceResources "
+        "(id INTEGER PRIMARY KEY, zone TEXT, component TEXT, logicalComponent TEXT, "
+        "serviceType TEXT, service TEXT, pathOrder INTEGER)"
+    )
+    conn.execute(
+        "CREATE VIEW ServiceImplementationZonedService AS SELECT * "
+        "FROM ServiceImplementationServiceResources"
+    )
+    conn.execute(
+        "INSERT INTO ServiceImplementationServiceResources VALUES "
+        "(1, 'Kitchen', 'Music', 'Audio Zone 1', 'SVC_AV_SAVANTMUSIC', "
+        "'Kitchen-Music-Audio-Zone-1', 0)"
+    )
+    devices = uiconfig._parse_connection(conn)
+    conn.close()
+    media = devices[0]
+    assert media.extra["media_server_id"].startswith("server:")
+    assert media.extra["zone_id"].startswith("zone:")
+    assert "Music" not in media.extra["media_server_id"]
 
 
 def test_parse_archive_empty():
