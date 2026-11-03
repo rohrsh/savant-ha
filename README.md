@@ -63,6 +63,63 @@ Settings → Devices & Services → **Add Integration** → **Savant**.
 Optional advanced settings (a cached `hostToken`, `cloudToken`/`configurationID`, or
 extra room names) live behind the integration's **Configure** button.
 
+### Existing Lutron lights and shades
+
+When the built-in `lutron_caseta` integration (Caseta/RA2 Select) already provides lights or covers,
+Savant setup and device refresh suggest duplicates using exact, case-insensitive names
+and matching Home Assistant area names within the same entity domain. A light never
+matches a cover. Whitespace differences and an area prefix in a
+light name are ignored; missing areas, ambiguous matches, disabled entities/devices, and
+disabled Lutron entries are not used. No bridge connection or device control is performed.
+
+When matches are found, setup and **Reconfigure** show an **Exclude matching Lutron
+devices?** choice before the device picker. **Exclude** omits matched lights and covers
+from both the picker and the saved Savant inventory, including previously imported
+matches. **Include** keeps them in the picker, selected by default. Unmatched Savant
+devices are unaffected. If no matches are found, the extra choice is skipped.
+The choice is a form with explicit radio-option labels and a Submit button, not a
+two-row navigation menu. Labels include the matched-device count and action. The
+CoolMasterNet prompt uses the same form-based approach with its own explicit options.
+Select an option and submit it; there is no default choice. The explanatory paragraphs
+still depend on translations, but the option text does not.
+
+If diagnosing a blank prompt, DEBUG lines `Savant setup choice form step=lutron` and
+`Savant setup choice form step=coolmaster` identify the screen actually being shown.
+After updating, restart HA, close any old setup dialogs, and start a fresh Reconfigure
+flow. Two blank navigation rows are not the new form UI.
+
+Nothing is saved until you submit the final device picker, so canceling leaves the
+existing configuration unchanged. Reconfiguration asks again rather than permanently
+remembering the exclusion choice. Direct Lutron entities are never modified; existing
+HA entity registry records are not automatically deleted. An empty remaining inventory
+can be accepted without importing any devices.
+
+These are name-and-area suggestions, not verified hardware matches: Savant addresses
+have no established mapping to Caseta serial numbers. Renamed or differently assigned
+lights may need manual selection. Other Lutron integrations are not matched.
+
+Both the original and user-assigned entity/device names are considered, so renaming a
+Lutron entity does not discard its original name as matching evidence. The effective
+Home Assistant area still takes precedence; names never override an assigned area.
+
+When Lutron is loaded, its cached load names are also matched. These omit the generated
+floor/room hierarchy that HA adds to display names. Each cached name is associated with
+its registry entity by Lutron's own serial-based unique ID (or its bridge-scoped ID when
+no serial exists), separately for lights and covers. This mirrors Home Assistant's
+open-source [`lutron_caseta` entity implementation](https://github.com/home-assistant/core/blob/2026.10.0/homeassistant/components/lutron_caseta/entity.py).
+No network query is made. If Lutron's runtime cache is unavailable, matching uses registry
+names only; arbitrary display-name suffixes or floor labels are never guessed.
+
+With debug logging enabled, `Savant Lutron registry scan` reports configured entry,
+light/cover, and eligible-light/cover counts, plus exclusions for disabled records or missing
+areas and names. `source_names` counts registry entities associated with cached load names.
+`Savant Lutron matching summary` reports the matching results separately
+for `domain=light` and `domain=cover`, including missing areas, unmatched areas/names,
+ambiguous candidates, and suggestions. These summaries contain counts only.
+
+The temporary per-device name/area debug printing has been removed. Only aggregate
+Lutron matching diagnostics are logged, even at DEBUG level.
+
 ## Entities (created only for the devices you import)
 
 | Platform | Device source | Entities |
@@ -71,8 +128,82 @@ extra room names) live behind the integration's **Configure** button.
 | Climate | `HVACEntities` | configured captured modes/setpoints and read-only CoolMaster state |
 | Cover | `ShadeEntities` | capture-backed shade open/close and position; stop is not captured |
 | Fan | `FanEntities` | exact per-device state, read-only |
-| Media Player | `ServiceImplementationZonedService` (one selectable source or Apple TV endpoint per room) | music: browsing/search, playback, now-playing, power, volume, transport, and album art; Apple TV: archive-declared power, volume, and play/pause |
+| Media Player | `ServiceImplementationZonedService` (one selectable source or Apple TV endpoint per room) | music: browsing, global catalog search, playback, now-playing, power, volume, transport, and album art; Apple TV: archive-declared power, volume, and play/pause |
 | Scene | Savant dashboard `scenesAndFoldersReduced` updates | standalone native `scene.turn_on` activation |
+
+## Shared media-server routing
+
+Several room media-player entities can be endpoint projections of one physical Savant
+media server. For example, room-specific `Music` entities share the server's content and
+transport while each entity controls whether its own Savant zone receives that server.
+The integration derives this relationship from the configuration archive's physical
+component and room identifiers, never from entity IDs, room names, or display names.
+
+Every projected media-player entity exposes these stable state attributes:
+
+- `savant_media_server_id`: opaque physical media-server identifier.
+- `savant_zone_id`: opaque identifier for this endpoint's Savant zone.
+- `savant_selected_zone_entity_ids`: sorted exact HA entity IDs currently selected for
+  the server. Every alias of one server reports the same list.
+- `savant_shared_media_server`: `true` when multiple imported endpoints project the server.
+
+Use `savant_ha.set_media_server_zones` before `media_player.play_media`. The
+`zone_entity_ids` list is the complete desired replacement state, not an incremental
+addition. The service removes extra selected endpoints first, adds missing endpoints,
+waits for authoritative Savant state pushes, and returns the verified final topology when
+the caller requests response data. Repeating an already-correct request sends no controls.
+
+Music browse IDs are opaque, deterministic hashes of the captured node. They remain
+stable when the same catalog node is returned again, while the Savant routing metadata
+remains private to the integration.
+Playlist normal-play and shuffle actions are returned as playable browse entries. Shuffle
+is intentionally not exposed as a standalone media-player toggle because Savant has no
+captured standalone shuffle setter.
+
+Isolate playback to one room:
+
+```yaml
+action: savant_ha.set_media_server_zones
+data:
+  entity_id: media_player.master_bath_music
+  zone_entity_ids:
+    - media_player.master_bath_music
+response_variable: savant_route
+```
+
+Select multiple rooms:
+
+```yaml
+action: savant_ha.set_media_server_zones
+data:
+  entity_id: media_player.master_bath_music
+  zone_entity_ids:
+    - media_player.master_bath_music
+    - media_player.dining_room_music
+```
+
+Deselect every imported endpoint for the server:
+
+```yaml
+action: savant_ha.set_media_server_zones
+data:
+  entity_id: media_player.master_bath_music
+  zone_entity_ids: []
+```
+
+An empty route works when every currently selected endpoint supports Savant `PowerOff`;
+otherwise the service fails explicitly and reports the actual selected set. Only imported
+endpoint projections have HA entity IDs and can be requested or reported, but the complete
+archive topology is retained so exact replacement also deselects active, unimported
+endpoints. Existing entries must be reconfigured once to acquire that complete topology;
+until then exact routing and grouping fail explicitly while existing media controls continue
+to work.
+
+Standard Home Assistant grouping is also supported for shared servers. `group_members`
+reports the same exact selected endpoint IDs, `media_player.join` adds same-server
+endpoints, and `media_player.unjoin` removes the targeted endpoint. Cross-server joins are
+rejected. Grouping and exact replacement use the same per-server lock and verification
+path. Playback itself remains backward compatible and does not implicitly isolate a room.
 
 ## Limitations / open questions
 
@@ -89,6 +220,58 @@ These are inherited from the sibling protocol document — see `PROTOCOL.md` §7
 
 New climate imports honor archive `isCelsius`, range, and mode-capability fields. Legacy
 fallback devices retain the original Fahrenheit defaults.
+
+## Debug logging
+
+Logging is controlled through Home Assistant's native integration UI; no YAML edit or
+Savant-specific toggle is needed. Open **Settings → Devices & Services → Savant** and
+use the integration menu's **Enable debug logging** or log-level control (wording varies
+by Home Assistant version). Select **Debug** if a level picker is shown.
+
+For missing scenes, enable logging **before reloading the Savant integration** so the
+capture includes authentication and the initial dashboard subscription. After reproducing,
+disable debug logging or restore the previous level. Download the captured log when Home
+Assistant offers it. Logging covers all Savant entries, not just one host.
+
+Scene diagnostics distinguish these stages without logging scene names, IDs, or payloads:
+
+- `Savant scene subscription sent`: the scene-list registration was sent.
+- `Savant dashboard update has no scene inventory`: a dashboard message arrived, but it
+  did not contain the expected scene-list state.
+- `Savant dashboard scene candidate`: structural details of an unrecognized message,
+  including field types, whether `state` exists, and the `value` container size. Only known
+  field names and the subscribed dashboard state names are shown; other keys and values
+  are masked. Output is limited to five messages and twelve fields per message, without
+  limiting scene parsing. This distinguishes unrelated `RecentServices` replies from
+  unexpected scene-list wrappers without exposing scene contents.
+- `Savant scene inventory ignored`: the scene-list value had an unexpected type.
+- `Savant scene inventory received`: total entries, accepted unique scenes, and rejected
+  or duplicate entries; zero entries means the host supplied an empty inventory.
+- `Savant scene inventory delivered`: inventory reached the hub, with callback count.
+- `Savant scene platform waiting`: the scene platform loaded before an inventory arrived.
+- `Savant scene reconciliation`: inventory size, additions requested, live removals,
+  and tracked scenes. Additions do not prove entities are enabled in Home Assistant.
+
+Review debug logs before sharing: other diagnostics can include search text, state keys,
+and network details. Do not share credentials or unredacted client-site information.
+
+### Search diagnostics
+
+The same control enables music-search diagnostics. For installations managed through
+YAML, the equivalent logger configuration is:
+
+```yaml
+logger:
+  logs:
+    custom_components.savant_ha: debug
+```
+
+Search traces include queue wait, search `correlation_id`, RPC `request_id`, response
+time, retry source (`initial`, `refresh`, or `watchdog`), and final outcome/elapsed time.
+The same correlation ID spans all attempts; RPC request IDs change on each attempt.
+Refreshes with `reason=no_local_waiter` have no matching active search in this client;
+their arrival alone does not measure HA search latency. Logs include search terms, so
+review them for private information before sharing.
 
 ## Development
 

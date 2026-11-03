@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime
 
 from homeassistant.components.media_player import (
@@ -19,7 +18,7 @@ from homeassistant.components.media_player import (
 from homeassistant.components.media_player.errors import BrowseError, SearchError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -41,7 +40,14 @@ from .const import (
 from .control import audio_zone_logical_component, coerce_number, parse_media_time
 from .entity import SavantEntity
 from .hub import SavantHub
-from .savant_client import image_content_type
+from .media_routing import (
+    MediaRouteError,
+    is_direct_media_action,
+    media_action_title,
+    opaque_model_id,
+    stable_media_node_id,
+)
+from .savant_client import SavantError, image_content_type
 
 _SONG = "CurrentSongName"
 _ARTIST = "CurrentArtistName"
@@ -55,6 +61,7 @@ _ARTWORK = "CurrentArtworkPath"
 _RAW_VOLUME_MAX = 50  # PROTOCOL.md §5.4 / sibling PROTOCOL.md §6.1, §7.2.
 _MUSIC_POWER_TIMEOUT = 5.0
 _NON_MEDIA_ROOT_TITLES = frozenset({"settings", "savant music", "select server"})
+_SEARCH_NODE_ID = "savant-search"
 
 
 class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
@@ -81,6 +88,13 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         self._variant_id = str(control.get("variant_id") or "1")
         self._service_id = str(control.get("service_id") or "")
         self._service_type = str(control.get("service_type") or SVC_AV_SAVANTMUSIC)
+        self._media_server_id = str(control.get("media_server_id") or "") or opaque_model_id(
+            "server", component, self._service_type
+        )
+        self._zone_id = str(control.get("zone_id") or "") or opaque_model_id(
+            "zone", self._room, self._service_id, logical_component, str(device["id"])
+        )
+        self.route_id = str(device["id"])
         self._requests = set(control.get("requests") or ())
         if self._service_type == SVC_AV_SAVANTMUSIC and not self._requests:
             self._requests = {
@@ -104,6 +118,20 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         self._browse_nodes: dict[str, dict[str, object]] = {}
         self._browse_artwork: dict[str, bytes] = {}
         self._music_active = asyncio.Event()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.hub.register_media_entity(self)
+        # A later alias can change shared-server/group attributes on earlier aliases.
+        for entity in self.hub.media_server_entities(self._media_server_id):
+            entity.async_write_ha_state()
+
+    async def async_will_remove_from_hass(self) -> None:
+        server_id = self._media_server_id
+        self.hub.unregister_media_entity(self)
+        for entity in self.hub.media_server_entities(server_id):
+            entity.async_write_ha_state()
+        await super().async_will_remove_from_hass()
 
     def _value(self, attr: str) -> object:
         return self._state(f"{self._component}.{self._logical_component}.{attr}")
@@ -151,6 +179,19 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
         features = MediaPlayerEntityFeature(0)
+        # Home Assistant rejects entity services before invoking the entity when a
+        # required feature is absent. Advertise the standard transport surface so
+        # archive-declared gaps reach the explicit ServiceValidationError checks below
+        # instead of becoming HTTP 500 responses from the core service dispatcher.
+        features |= (
+            MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.PLAY
+            | MediaPlayerEntityFeature.PAUSE
+            | MediaPlayerEntityFeature.STOP
+            | MediaPlayerEntityFeature.NEXT_TRACK
+            | MediaPlayerEntityFeature.PREVIOUS_TRACK
+        )
         if VERB_POWER_ON in self._requests:
             features |= MediaPlayerEntityFeature.TURN_ON
         if VERB_POWER_OFF in self._requests:
@@ -171,7 +212,40 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             features |= MediaPlayerEntityFeature.BROWSE_MEDIA | MediaPlayerEntityFeature.SEARCH_MEDIA
             if self._activity_is_addressable:
                 features |= MediaPlayerEntityFeature.PLAY_MEDIA
+        if self.savant_shared_media_server:
+            features |= MediaPlayerEntityFeature.GROUPING
         return features
+
+    @property
+    def savant_media_server_id(self) -> str:
+        return self._media_server_id
+
+    @property
+    def savant_zone_id(self) -> str:
+        return self._zone_id
+
+    @property
+    def savant_selected_zone_entity_ids(self) -> list[str]:
+        return self.hub.selected_media_zone_entity_ids(self._media_server_id)
+
+    @property
+    def savant_shared_media_server(self) -> bool:
+        return self.hub.media_topology_complete and len(
+            self.hub.media_server_entities(self._media_server_id)
+        ) > 1
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        return {
+            "savant_media_server_id": self.savant_media_server_id,
+            "savant_zone_id": self.savant_zone_id,
+            "savant_selected_zone_entity_ids": self.savant_selected_zone_entity_ids,
+            "savant_shared_media_server": self.savant_shared_media_server,
+        }
+
+    @property
+    def group_members(self) -> list[str] | None:
+        return self.savant_selected_zone_entity_ids
 
     @property
     def media_title(self) -> str | None:
@@ -260,20 +334,58 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
 
     async def async_turn_on(self) -> None:
         if VERB_POWER_ON not in self._requests:
-            return
-        await self._media_request(VERB_POWER_ON)
+            raise ServiceValidationError("Savant endpoint does not support PowerOn")
+        try:
+            await self.hub.async_set_media_endpoint_power(self, True)
+        except MediaRouteError as err:
+            raise HomeAssistantError(str(err)) from err
         self._power_off_requested = False
         self._optimistic_state = MediaPlayerState.ON
         self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
         if VERB_POWER_OFF not in self._requests:
-            return
-        await self._media_request(VERB_POWER_OFF)
+            raise ServiceValidationError("Savant endpoint does not support PowerOff")
+        try:
+            await self.hub.async_set_media_endpoint_power(self, False)
+        except MediaRouteError as err:
+            raise HomeAssistantError(str(err)) from err
         self._power_off_requested = True
         self._optimistic_state = MediaPlayerState.OFF
         self._music_active.clear()
         self.async_write_ha_state()
+
+    async def _async_set_route_selected(self, selected: bool) -> None:
+        verb = VERB_POWER_ON if selected else VERB_POWER_OFF
+        if verb not in self._requests:
+            raise HomeAssistantError(f"Savant endpoint does not support {verb}")
+        await self._media_request(verb)
+
+    async def async_set_media_server_zones(
+        self, zone_entity_ids: list[str]
+    ) -> dict[str, object]:
+        try:
+            return await self.hub.async_set_media_server_zones(self, zone_entity_ids)
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+        except MediaRouteError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def async_join_players(self, group_members: list[str]) -> None:
+        try:
+            await self.hub.async_join_media_server_zones(self, group_members)
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+        except MediaRouteError as err:
+            raise HomeAssistantError(str(err)) from err
+
+    async def async_unjoin_player(self) -> None:
+        try:
+            await self.hub.async_unjoin_media_server_zone(self)
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+        except MediaRouteError as err:
+            raise HomeAssistantError(str(err)) from err
 
     async def async_set_volume_level(self, volume: float) -> None:
         if VERB_SET_VOLUME not in self._requests:
@@ -287,7 +399,7 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
 
     async def async_media_play(self) -> None:
         if VERB_PLAY not in self._requests:
-            return
+            raise ServiceValidationError("Savant endpoint does not support Play")
         await self._media_request(VERB_PLAY)
         if self._service_type != SVC_AV_SAVANTMUSIC:
             # The native app immediately cancels repeat after Apple TV Play (PROTOCOL.md §5.4).
@@ -298,20 +410,26 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
 
     async def async_media_pause(self) -> None:
         if VERB_PAUSE not in self._requests:
-            return
+            raise ServiceValidationError("Savant endpoint does not support Pause")
         await self._media_request(VERB_PAUSE)
         self._optimistic_state = MediaPlayerState.PAUSED
         self.async_write_ha_state()
 
     async def async_media_next_track(self) -> None:
         if VERB_SKIP_UP not in self._requests:
-            return
+            raise ServiceValidationError("Savant endpoint does not support SkipUp")
         await self._media_request(VERB_SKIP_UP)
 
     async def async_media_previous_track(self) -> None:
         if VERB_SKIP_DOWN not in self._requests:
-            return
+            raise ServiceValidationError("Savant endpoint does not support SkipDown")
         await self._media_request(VERB_SKIP_DOWN)
+
+    async def async_media_stop(self) -> None:
+        """Reject stop explicitly; Savant exposes pause but no stop verb."""
+        raise ServiceValidationError(
+            "Savant media endpoints do not expose a standard Stop command"
+        )
 
     async def async_media_seek(self, position: float) -> None:
         if VERB_SEEK not in self._requests:
@@ -330,13 +448,26 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         """Return the capture-backed Savant Music folder tree (sibling PROTOCOL.md §8.3)."""
         if self._service_type != SVC_AV_SAVANTMUSIC:
             raise BrowseError("Savant media browsing is available only for Savant Music")
-        if media_content_id is None:
-            self._browse_nodes.clear()
-            self._browse_artwork.clear()
-            result = await self.hub.client.async_browse_music(
-                self._component, self._logical_component, operation="getRoot"
+        if media_content_id == _SEARCH_NODE_ID:
+            return BrowseMedia(
+                media_class=MediaClass.DIRECTORY,
+                media_content_id=_SEARCH_NODE_ID,
+                media_content_type=MediaType.MUSIC,
+                title="Search Savant Music",
+                can_play=False,
+                can_expand=True,
+                can_search=True,
+                children=[],
             )
-            return self._browse_result(result, "Savant Music")
+        if media_content_id is None:
+            self._browse_artwork.clear()
+            try:
+                result = await self.hub.client.async_browse_music(
+                    self._component, self._logical_component, operation="getRoot"
+                )
+            except (SavantError, ValueError) as err:
+                raise BrowseError(str(err) or "Savant media browsing failed") from err
+            return self._browse_result(result, "Savant Music", include_search=True)
         node = self._browse_nodes.get(media_content_id)
         if node is None:
             raise BrowseError("Savant media item is no longer available; browse again")
@@ -349,7 +480,7 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
                 result = await self.hub.client.async_browse_music(
                     self._component, self._logical_component, operation="browse", node=node
                 )
-        except ValueError as err:
+        except (SavantError, ValueError) as err:
             raise BrowseError("Savant media item cannot be opened") from err
         return self._browse_result(result, str(node.get("title") or "Savant Music"))
 
@@ -357,12 +488,18 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         """Search captured Savant Music catalogs with the supported all-service scope."""
         if self._service_type != SVC_AV_SAVANTMUSIC:
             raise SearchError("Savant media search is available only for Savant Music")
+        search_term = query.search_query
+        if not search_term.strip():
+            return SearchMedia(result=[])
+        # The captured endpoint supports only global filter:"all" search. Home Assistant
+        # supplies the current opaque browse ID, but mapping that to a provider filter
+        # would invent uncaptured behavior. Do not advertise media-class filters either.
         try:
             result = await self.hub.client.async_search_music(
-                self._component, self._logical_component, query.search_query
+                self._component, self._logical_component, search_term
             )
-        except ValueError as err:
-            raise SearchError("Savant media search failed") from err
+        except (SavantError, ValueError) as err:
+            raise SearchError(str(err) or "Savant media search failed") from err
         nodes = result.get("nodes")
         return SearchMedia(
             result=[
@@ -381,24 +518,30 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         if self._service_type != SVC_AV_SAVANTMUSIC or media_type != MediaType.MUSIC:
             return
         node = self._browse_nodes.get(media_id)
-        if node is None or node.get("actionType") != "action":
+        if node is None or not self._is_playable_node(node):
             return
         if self._is_active_service():
             self._music_active.set()
         if not self._music_active.is_set():
             if VERB_POWER_ON not in self._requests:
                 raise HomeAssistantError("Savant Music cannot be turned on for playback")
-            await self.async_turn_on()
+            try:
+                await self.async_turn_on()
+            except SavantError as err:
+                raise HomeAssistantError(str(err)) from err
             try:
                 await asyncio.wait_for(self._music_active.wait(), _MUSIC_POWER_TIMEOUT)
             except TimeoutError as err:
                 raise HomeAssistantError("Savant Music did not turn on for playback") from err
         try:
             await self.hub.client.async_follow_music_node(
-                self._component, self._logical_component, node
+                self._component,
+                self._logical_component,
+                node,
+                strip_presentation=True,
             )
-        except ValueError:
-            return
+        except (SavantError, ValueError) as err:
+            raise HomeAssistantError(str(err) or "Savant media playback failed") from err
 
     async def async_get_browse_image(
         self,
@@ -425,17 +568,34 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
                 self._browse_artwork[artwork_key] = artwork
         return artwork, image_content_type(artwork) if artwork is not None else None
 
-    def _browse_result(self, result: dict[str, object], title: str) -> BrowseMedia:
+    def _browse_result(
+        self, result: dict[str, object], title: str, *, include_search: bool = False
+    ) -> BrowseMedia:
         nodes = result.get("nodes")
-        children = (
-            [
-                self._browse_node(node)
-                for node in nodes
-                if isinstance(node, dict) and self._is_media_browse_node(node)
-            ]
-            if isinstance(nodes, list)
-            else []
-        )
+        children: list[BrowseMedia] = []
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if not self._is_media_browse_node(node):
+                    children.extend(
+                        self._browse_node(child)
+                        for child in self._playable_browse_children(node)
+                    )
+                else:
+                    children.append(self._browse_node(node))
+        if include_search:
+            children.insert(
+                0,
+                BrowseMedia(
+                    media_class=MediaClass.DIRECTORY,
+                    media_content_id=_SEARCH_NODE_ID,
+                    media_content_type=MediaType.MUSIC,
+                    title="Search Savant Music",
+                    can_play=False,
+                    can_expand=True,
+                ),
+            )
         return BrowseMedia(
             media_class=MediaClass.DIRECTORY,
             media_content_id="root",
@@ -448,11 +608,12 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
 
     def _browse_node(self, node: dict[str, object]) -> BrowseMedia:
         """Translate one opaque Savant UI node without exposing its provider metadata."""
-        node_id = uuid.uuid4().hex
+        node_id = stable_media_node_id(node)
         self._browse_nodes[node_id] = node
         browsable = node.get("actionType") == "browsable"
-        playable = node.get("actionType") == "action" and self._activity_is_addressable
-        title = str(node.get("title") or node.get("subtitle") or "Savant Music")
+        children = self._browse_node_children(node) if browsable else []
+        playable = self._is_playable_node(node)
+        title = media_action_title(node)
         return BrowseMedia(
             media_class=MediaClass.DIRECTORY if browsable else MediaClass.MUSIC,
             media_content_id=node_id,
@@ -460,6 +621,7 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             title=title,
             can_play=playable,
             can_expand=browsable,
+            children=children,
             thumbnail=(
                 self.get_browse_image_url(MediaType.MUSIC, node_id)
                 if isinstance(node.get("artworkKey"), str) and node["artworkKey"]
@@ -467,13 +629,40 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
             ),
         )
 
-    @staticmethod
-    def _is_media_browse_node(node: dict[str, object]) -> bool:
+    def _browse_node_children(self, node: dict[str, object]) -> list[BrowseMedia]:
+        children = node.get("children")
+        if not isinstance(children, list):
+            return []
+        return [
+            self._browse_node(child)
+            for child in children
+            if isinstance(child, dict) and self._is_media_browse_node(child)
+        ]
+
+    def _playable_browse_children(self, node: dict[str, object]) -> list[dict[str, object]]:
+        children = node.get("children")
+        if not isinstance(children, list):
+            return []
+        return [
+            child
+            for child in children
+            if isinstance(child, dict)
+            and self._is_media_browse_node(child)
+            and self._is_playable_node(child)
+        ]
+
+    def _is_playable_node(self, node: dict[str, object]) -> bool:
+        """Recognize returned direct-play actions, including playlist shuffle actions."""
+        return is_direct_media_action(node, addressable=self._activity_is_addressable)
+
+    def _is_media_browse_node(self, node: dict[str, object]) -> bool:
         """Hide captured navigation/status entries that cannot select media."""
         title = str(node.get("title") or "").strip().casefold()
         if title in _NON_MEDIA_ROOT_TITLES or title.startswith("connected to"):
             return False
-        return node.get("actionType") in {"browsable", "action"}
+        if node.get("actionType") in {"browsable", "action"}:
+            return True
+        return False
 
     def _active_services(self) -> set[str]:
         """Return exact identifiers from both captured room service states."""
@@ -491,6 +680,16 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
 
     def _is_active_service(self) -> bool:
         """Return whether this endpoint is active in either room service state."""
+        services = self._active_services()
+        return self._service_id in services if self._service_id else bool(services)
+
+    def _route_selection_state(self) -> bool | None:
+        """Return exact membership, or None until room route state is known."""
+        if not all(
+            f"{self._room}.{attribute}" in self.hub.states
+            for attribute in ("ActiveService", "ActiveServices")
+        ):
+            return None
         services = self._active_services()
         return self._service_id in services if self._service_id else bool(services)
 

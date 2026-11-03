@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import json
 
 import msgpack
 import pytest
@@ -178,7 +179,28 @@ def test_send_handshake_uses_expected_envelope():
     assert reg_messages == [{"state": "a.b"}]
 
 
-def test_post_auth_matches_observed_state_startup_order():
+def test_send_failures_are_normalized_as_connection_errors():
+    client = SavantClient("10.0.0.5", 12345)
+
+    class FailingWebSocket:
+        closed = False
+
+        async def send_bytes(self, data):  # noqa: ARG002
+            raise OSError("socket closed")
+
+    client._ws = FailingWebSocket()  # type: ignore[assignment]
+
+    async def run():
+        with pytest.raises(sc.SavantConnectionError, match="connection lost"):
+            await client.request("state/register", [{"state": "a.b"}])
+        with pytest.raises(sc.SavantConnectionError, match="connection lost"):
+            await client._request_music("music/test", [], include_identity=False)
+
+    asyncio.run(run())
+
+
+def test_post_auth_matches_observed_state_startup_order(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
     client = SavantClient("10.0.0.5", 12345, subscribe_keys=["a.b"])
     client._authorized = True
     sent: list[tuple[str, list]] = []
@@ -195,15 +217,11 @@ def test_post_auth_matches_observed_state_startup_order():
 
     asyncio.run(run())
 
+    assert "Savant scene subscription sent state=scenesAndFoldersReduced" in caplog.text
     assert sent == [
         ("session/fileDownload", [{"filePath": "uiconfig.tar.gz"}]),
-        (
-            "dis/dashboard/register",
-            [
-                {"state": DASHBOARD_STATE_RECENT_SERVICES},
-                {"state": SCENES_STATE_KEY},
-            ],
-        ),
+        ("dis/dashboard/register", [{"state": DASHBOARD_STATE_RECENT_SERVICES}]),
+        ("dis/dashboard/register", [{"state": SCENES_STATE_KEY}]),
         (URI_STATE_REGISTER, [{"state": "global.SonosGroups"}]),
         ("dis/userData/register", [{"state": "local.setting.update"}]),
         ("dis/userData/register", [{"state": "user.setting.update"}]),
@@ -212,6 +230,25 @@ def test_post_auth_matches_observed_state_startup_order():
         ("dcm/request", [{"request": "getMode"}]),
         ("dis/userData/register", [{"state": "global.image.update"}]),
         ("dis/userData/register", [{"state": "user.image.update"}]),
+    ]
+
+
+def test_dashboard_subscriptions_use_separate_single_state_websocket_frames():
+    client = SavantClient("example.invalid", 12345)
+    frames = []
+
+    class WebSocket:
+        closed = False
+
+        async def send_bytes(self, data):
+            frames.append(msgpack.unpackb(data, raw=False))
+
+    client._ws = WebSocket()
+    asyncio.run(client._send_dashboard_register())
+    assert [frame["URI"] for frame in frames] == ["dis/dashboard/register"] * 2
+    assert [frame["messages"] for frame in frames] == [
+        [{"state": DASHBOARD_STATE_RECENT_SERVICES}],
+        [{"state": SCENES_STATE_KEY}],
     ]
 
 
@@ -792,6 +829,91 @@ def test_scene_summaries_accepts_an_empty_authoritative_list():
     assert scene_summaries_from_messages([{"state": "RecentServices", "value": []}]) is None
 
 
+@pytest.mark.parametrize("value", [None, "private-scene-payload", {"private-key": []}, 42])
+def test_scene_inventory_logs_malformed_value_type_without_payload(caplog, value):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    assert scene_summaries_from_messages(
+        [{"state": SCENES_STATE_KEY, "value": value}]
+    ) is None
+    assert f"expected list, value_type={type(value).__name__}" in caplog.text
+    assert "private-scene-payload" not in caplog.text
+    assert "private-key" not in caplog.text
+
+
+@pytest.mark.parametrize("value, counts", [
+    ([], "entries=0 accepted=0 rejected_or_duplicate=0"),
+    ([
+        {"id": "private-id", "name": "Private Scene"},
+        {"id": "private-id", "name": "Private Duplicate"},
+        {"id": 123, "name": "Private Invalid"},
+        None,
+    ], "entries=4 accepted=1 rejected_or_duplicate=3"),
+])
+def test_scene_inventory_logs_counts_without_scene_details(caplog, value, counts):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    scene_summaries_from_messages([{"state": SCENES_STATE_KEY, "value": value}])
+    assert f"Savant scene inventory received {counts}" in caplog.text
+    assert "private-id" not in caplog.text
+    assert "Private" not in caplog.text
+
+
+def test_dashboard_update_without_scene_inventory_is_logged(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    client = SavantClient("example.invalid", 12345)
+    seen = []
+    client.on_scenes_update = seen.append
+    client._handle_frame(_frame({
+        "URI": "dis/dashboard/update",
+        "messages": [{"state": "RecentServices", "value": []}],
+    }))
+    assert "Savant dashboard update has no scene inventory" in caplog.text
+    assert "state_present=True state=RecentServices value_type=list value_count=0" in caplog.text
+    assert seen == []
+
+
+@pytest.mark.parametrize("message", [
+    {"name": SCENES_STATE_KEY, "value": [{"id": "private-id", "name": "private-scene"}]},
+    {"private-key": "private-value", "state": "private-state", "value": "private-payload"},
+    {"state": {"private-key": "private-value"}, "value": {"private-id": "private-scene"}},
+    "private-payload",
+])
+def test_unrecognized_dashboard_messages_log_only_safe_structure(caplog, message):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    assert scene_summaries_from_messages([message]) is None
+    assert "Savant dashboard scene candidate index=0" in caplog.text
+    assert "private-" not in caplog.text
+    assert "Savant scene inventory received" not in caplog.text
+
+
+def test_dashboard_structural_logging_is_bounded(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    message = {f"private-key-{index}": "private-value" for index in range(100)}
+    assert scene_summaries_from_messages([message] * 100) is None
+    summaries = [record.message for record in caplog.records if "scene candidate" in record.message]
+    assert len(summaries) == 5
+    assert all(summary.count("<other>") == 12 for summary in summaries)
+    assert "private-" not in caplog.text
+
+
+def test_dashboard_diagnostic_limit_does_not_limit_scene_parsing(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    assert scene_summaries_from_messages(
+        [{"state": "RecentServices", "value": []}] * 10
+        + [{"state": SCENES_STATE_KEY, "value": []}]
+    ) == {}
+    assert "Savant scene inventory received entries=0" in caplog.text
+
+
+def test_scene_inventory_without_callback_is_logged(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    client = SavantClient("example.invalid", 12345)
+    client._handle_frame(_frame({
+        "URI": "dis/dashboard/update",
+        "messages": [{"state": SCENES_STATE_KEY, "value": []}],
+    }))
+    assert "Savant scene inventory not delivered: no inventory callback" in caplog.text
+
+
 def test_dashboard_scene_update_notifies_inventory_callback():
     client = SavantClient("10.0.0.5", 12345)
     seen: list[dict[str, dict[str, object]]] = []
@@ -942,6 +1064,48 @@ def test_follow_music_node_without_query_uses_browse_endpoint():
     assert sent[0][1][0]["node"] is node
 
 
+def test_follow_music_action_strips_presentation_fields_but_preserves_item():
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]], bool]] = []
+    node = {
+        "actionType": "action",
+        "query": "browse",
+        "icon": "music_icon_shuffle",
+        "title": "My Playlist",
+        "arguments": {"item": '{"defaultAction":17}'},
+        "displayType": "list",
+        "children": [{"title": "Play"}],
+        "hasSubmenu": True,
+    }
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            sent.append((uri, messages, include_identity))
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        task = asyncio.create_task(
+            client.async_follow_music_node(
+                "Music", "Audio Zone 1", node, strip_presentation=True
+            )
+        )
+        await asyncio.sleep(0)
+        uri, messages, _ = sent[0]
+        client._handle_frame(
+            _frame({"URI": uri, "messages": [{"requestId": messages[0]["requestId"], "nodes": []}]})
+        )
+        await task
+
+    asyncio.run(run())
+    submitted = sent[0][1][0]["node"]
+    assert submitted == {
+        "actionType": "action",
+        "query": "browse",
+        "icon": "music_icon_shuffle",
+        "title": "My Playlist",
+        "arguments": {"item": '{"defaultAction":17}'},
+    }
+
+
 def test_search_music_waits_for_refresh_then_repeats_the_same_search_uuid():
     client = SavantClient("10.0.0.5", 12345)
     sent: list[tuple[str, list[dict[str, object]], bool]] = []
@@ -949,6 +1113,9 @@ def test_search_music_waits_for_refresh_then_repeats_the_same_search_uuid():
     async def run():
         async def fake_request(uri, messages, *, include_identity):
             sent.append((uri, messages, include_identity))
+            assert uri.endswith("/search")
+            search_uuid = messages[0]["arguments"]["uuid"]
+            assert ("Music.Audio Zone 1.", search_uuid) in client._pending_music_search_refresh
 
         client._request_music = fake_request  # type: ignore[assignment]
         task = asyncio.create_task(client.async_search_music("Music", "Audio Zone 1", "Beatles"))
@@ -967,12 +1134,14 @@ def test_search_music_waits_for_refresh_then_repeats_the_same_search_uuid():
             _frame(
                 {
                     "URI": "state/update",
-                    "messages": [{"state": "Music.Audio Zone 1.refreshLMQ", "value": f"search:{search_uuid}"}],
+                    "messages": [{"state": "Music.Audio Zone 1.refreshLMQ", "value": json.dumps({"from": f"search`search:{search_uuid}", "to": f"search`search:{search_uuid}"})}],
                 }
             )
         )
         await asyncio.sleep(0)
         _, second_messages, _ = sent[1]
+        assert second_messages[0]["arguments"]["uuid"] == search_uuid
+        assert second_messages[0]["requestId"] != messages[0]["requestId"]
         client._handle_frame(
             _frame(
                 {
@@ -984,16 +1153,847 @@ def test_search_music_waits_for_refresh_then_repeats_the_same_search_uuid():
         return await task
 
     result = asyncio.run(run())
-    assert sent[0][0] == "music/Music/Audio Zone 1/SVC_AV_SAVANTMUSIC/search"
+    assert len(sent) == 2
+    assert all(uri == "music/Music/Audio Zone 1/SVC_AV_SAVANTMUSIC/search" for uri, _, _ in sent)
     assert sent[0][2] is False
     assert sent[0][1][0]["clientType"] == "android"
     assert sent[0][1][0]["arguments"] == {
         "filter": "all",
         "searchTerm": "Beatles",
         "services": ["plex", "tunein", "amazonmusic", "playlists"],
-        "uuid": sent[1][1][0]["arguments"]["uuid"],
+        "uuid": sent[0][1][0]["arguments"]["uuid"],
     }
     assert result["nodes"] == [{"title": "Beatles"}]
+
+
+def test_search_music_registers_refresh_states_before_sending_search():
+    client = SavantClient("10.0.0.5", 12345)
+    events: list[tuple[str, object]] = []
+
+    async def run():
+        async def fake_register(keys, *, force=False):
+            events.append(("register", (set(keys), force)))
+
+        async def fake_request(uri, messages, *, include_identity):
+            events.append(("search", uri))
+            assert uri.endswith("/search")
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": True},
+                                "nodes": [{"displayType": "searchList", "title": "Fall"}],
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client.register_state_keys = fake_register  # type: ignore[assignment]
+        client._request_music = fake_request  # type: ignore[assignment]
+        return await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    result = asyncio.run(run())
+    assert events[0] == (
+        "register",
+        ({"Music.AVB Stream 5.refreshLMQ", "Music.AVB Stream 5.refreshLMQ3"}, True),
+    )
+    assert events[1] == ("search", "music/Music/AVB Stream 5/SVC_AV_SAVANTMUSIC/search")
+    assert len(events) == 2
+    assert result["nodes"][0]["title"] == "Fall"
+
+
+@pytest.mark.parametrize("nodes", [[], [{"displayType": "searchList", "title": "Fall"}]])
+def test_search_music_accepts_ready_results_returned_before_refresh(nodes):
+    client = SavantClient("10.0.0.5", 12345)
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": True},
+                                "nodes": nodes,
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        return await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    result = asyncio.run(run())
+    assert result["nodes"] == nodes
+
+
+@pytest.mark.parametrize("pending_nodes", [None, []])
+def test_search_music_retries_pending_via_watchdog_without_root(monkeypatch, pending_nodes):
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    search_count = 0
+
+    async def run():
+        nonlocal search_count
+
+        async def fake_register(keys, *, force=False):
+            return None
+
+        async def fake_request(uri, messages, *, include_identity):
+            nonlocal search_count
+            sent.append((uri, messages))
+            assert uri.endswith("/search")
+            search_count += 1
+            ready = search_count == 2
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": ready},
+                                "nodes": (
+                                    [{"displayType": "searchList", "title": "Fall"}]
+                                    if ready
+                                    else pending_nodes
+                                ),
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        client.register_state_keys = fake_register  # type: ignore[assignment]
+        return await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_READY_TIMEOUT", 0.2)
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 0.01)
+    result = asyncio.run(run())
+    assert search_count == 2
+    assert len(sent) == 2
+    assert sent[0][1][0]["arguments"] == sent[1][1][0]["arguments"]
+    assert sent[0][1][0]["requestId"] != sent[1][1][0]["requestId"]
+    assert result["nodes"][0]["title"] == "Fall"
+
+
+def test_search_music_reports_savant_error_response():
+    client = SavantClient("10.0.0.5", 12345)
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "success": False,
+                                "errorReason": "Music service unavailable",
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    with pytest.raises(sc.SavantError, match="Music service unavailable"):
+        asyncio.run(run())
+
+
+def test_search_music_ignores_unrelated_refresh_and_times_out(monkeypatch):
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_READY_TIMEOUT", 0.01)
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 0.1)
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            assert uri.endswith("/search")
+            sent.append(messages[0])
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": False},
+                                "nodes": [],
+                            }
+                        ],
+                    }
+                )
+            )
+            await asyncio.sleep(0)
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": "state/update",
+                        "messages": [
+                            {
+                                "state": "Music.AVB Stream 5.refreshLMQ",
+                                "value": json.dumps({"from": "search`search:unrelated", "to": "search`search:unrelated"}),
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    with pytest.raises(sc.SavantError, match="timed out waiting"):
+        asyncio.run(run())
+    assert len(sent) == 1
+    assert not client._pending_music_search_refresh
+
+
+def test_concurrent_music_searches_same_component_are_serialized_and_correlated():
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    search_sent: list[tuple[str, list[dict[str, object]]]] = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            sent.append((uri, messages))
+            assert uri.endswith("/search")
+            search_sent.append((uri, messages))
+            if len(search_sent) % 2 == 0:
+                return
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": False},
+                                "nodes": [],
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        tasks = [
+            asyncio.create_task(client.async_search_music("Music", "AVB Stream 5", term))
+            for term in ("Fall", "Winter")
+        ]
+        for _ in range(10):
+            if len(search_sent) >= 1:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 1
+        first_uuid = search_sent[0][1][0]["arguments"]["uuid"]
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": "state/update",
+                    "messages": [
+                        {
+                            "state": "Music.AVB Stream 5.refreshLMQ3",
+                            "value": json.dumps([{"from": "search:stale", "to": "search:stale"}]),
+                        }
+                    ],
+                }
+            )
+        )
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": "state/update",
+                    "messages": [
+                        {
+                            "state": "Music.AVB Stream 5.refreshLMQ3",
+                            "value": json.dumps([{"from": f"search:{first_uuid}", "to": f"search:{first_uuid}"}]),
+                        }
+                    ],
+                }
+            )
+        )
+        for _ in range(10):
+            if len(search_sent) >= 2:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 2
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": search_sent[1][0],
+                    "messages": [
+                        {
+                            "requestId": search_sent[1][1][0]["requestId"],
+                            "screenArguments": {"searchReady": True},
+                            "nodes": [{"displayType": "searchList", "title": "Fall"}],
+                        }
+                    ],
+                }
+            )
+        )
+        for _ in range(10):
+            if len(search_sent) >= 3:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 3
+        second_uuid = search_sent[2][1][0]["arguments"]["uuid"]
+        assert second_uuid != first_uuid
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": "state/update",
+                    "messages": [
+                        {
+                            "state": "Music.AVB Stream 5.refreshLMQ",
+                            "value": json.dumps({"from": f"search`search:{second_uuid}", "to": f"search`search:{second_uuid}"}),
+                        }
+                    ],
+                }
+            )
+        )
+        for _ in range(10):
+            if len(search_sent) >= 4:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 4
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": search_sent[3][0],
+                    "messages": [
+                        {
+                            "requestId": search_sent[3][1][0]["requestId"],
+                            "screenArguments": {"searchReady": True},
+                            "nodes": [{"displayType": "searchList", "title": "Winter"}],
+                        }
+                    ],
+                }
+            )
+        )
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(run())
+    assert [result["nodes"][0]["title"] for result in results] == ["Fall", "Winter"]
+    assert len(search_sent) == 4
+
+
+def test_multiple_music_searches_same_component_are_queued_without_cross_talk():
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    search_sent: list[tuple[str, list[dict[str, object]]]] = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            sent.append((uri, messages))
+            assert uri.endswith("/search")
+            search_sent.append((uri, messages))
+            if len(search_sent) % 2 == 0:
+                return
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": False},
+                                "nodes": [],
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        terms = ["Fall", "Chappell Roan", "Sabrina Carpenter"]
+        tasks = [
+            asyncio.create_task(client.async_search_music("Music", "AVB Stream 5", term))
+            for term in terms
+        ]
+        results = []
+        for index, term in enumerate(terms):
+            initial = index * 2
+            for _ in range(10):
+                if len(search_sent) >= initial + 1:
+                    break
+                await asyncio.sleep(0)
+            assert len(search_sent) == initial + 1
+            search_uuid = search_sent[initial][1][0]["arguments"]["uuid"]
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": "state/update",
+                        "messages": [
+                            {
+                                "state": "Music.AVB Stream 5.refreshLMQ",
+                                "value": json.dumps({"from": f"search`search:{search_uuid}", "to": f"search`search:{search_uuid}"}),
+                            }
+                        ],
+                    }
+                )
+            )
+            retry = initial + 1
+            for _ in range(10):
+                if len(search_sent) >= retry + 1:
+                    break
+                await asyncio.sleep(0)
+            assert len(search_sent) == retry + 1
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": search_sent[retry][0],
+                        "messages": [
+                            {
+                                "requestId": search_sent[retry][1][0]["requestId"],
+                                "screenArguments": {"searchReady": True},
+                                "nodes": [{"displayType": "searchList", "title": term}],
+                            }
+                        ],
+                    }
+                )
+            )
+            results.append(await tasks[index])
+        return results
+
+    results = asyncio.run(run())
+    assert [result["nodes"][0]["title"] for result in results] == [
+        "Fall",
+        "Chappell Roan",
+        "Sabrina Carpenter",
+    ]
+
+
+def test_music_searches_for_different_components_remain_concurrent():
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    search_sent: list[tuple[str, list[dict[str, object]]]] = []
+    initial_components: set[str] = set()
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            sent.append((uri, messages))
+            assert uri.endswith("/search")
+            search_sent.append((uri, messages))
+            component = uri.split("/", 2)[1]
+            if component in initial_components:
+                return
+            initial_components.add(component)
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": False},
+                                "nodes": [],
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        tasks = [
+            asyncio.create_task(client.async_search_music(component, "AVB Stream 5", term))
+            for component, term in (("Music", "Fall"), ("Other Music", "Winter"))
+        ]
+        for _ in range(10):
+            if len(search_sent) >= 2:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 2
+        for index, (component, _) in enumerate((("Music", "Fall"), ("Other Music", "Winter"))):
+            search_uuid = search_sent[index][1][0]["arguments"]["uuid"]
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": "state/update",
+                        "messages": [
+                            {
+                                "state": f"{component}.AVB Stream 5.refreshLMQ3",
+                                "value": json.dumps([{"from": f"search:{search_uuid}", "to": f"search:{search_uuid}"}]),
+                            }
+                        ],
+                    }
+                )
+            )
+        for _ in range(10):
+            if len(search_sent) >= 4:
+                break
+            await asyncio.sleep(0)
+        assert len(search_sent) == 4
+        for index, term in ((2, "Fall"), (3, "Winter")):
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": search_sent[index][0],
+                        "messages": [
+                            {
+                                "requestId": search_sent[index][1][0]["requestId"],
+                                "screenArguments": {"searchReady": True},
+                                "nodes": [{"displayType": "searchList", "title": term}],
+                            }
+                        ],
+                    }
+                )
+            )
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(run())
+    assert [result["nodes"][0]["title"] for result in results] == ["Fall", "Winter"]
+
+
+def test_cancelled_queued_music_search_does_not_affect_active_search():
+    client = SavantClient("10.0.0.5", 12345)
+    sent: list[tuple[str, list[dict[str, object]]]] = []
+    search_count = 0
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            nonlocal search_count
+            sent.append((uri, messages))
+            assert uri.endswith("/search")
+            search_count += 1
+            if search_count % 2 == 0:
+                return
+            client._handle_frame(
+                _frame(
+                    {
+                        "URI": uri,
+                        "messages": [
+                            {
+                                "requestId": messages[0]["requestId"],
+                                "screenArguments": {"searchReady": False},
+                                "nodes": [],
+                            }
+                        ],
+                    }
+                )
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        first = asyncio.create_task(client.async_search_music("Music", "AVB Stream 5", "Fall"))
+        for _ in range(10):
+            if len(sent) >= 1:
+                break
+            await asyncio.sleep(0)
+        assert len(sent) == 1
+        second = asyncio.create_task(
+            client.async_search_music("Music", "AVB Stream 5", "Cancelled")
+        )
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        search_index = next(index for index, (uri, _) in enumerate(sent) if uri.endswith("/search"))
+        assert search_index == 0
+        search_uuid = sent[search_index][1][0]["arguments"]["uuid"]
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": "state/update",
+                    "messages": [
+                        {
+                            "state": "Music.AVB Stream 5.refreshLMQ",
+                            "value": json.dumps({"from": f"search`search:{search_uuid}", "to": f"search`search:{search_uuid}"}),
+                        }
+                    ],
+                }
+            )
+        )
+        for _ in range(10):
+            if len(sent) >= search_index + 2:
+                break
+            await asyncio.sleep(0)
+        assert len(sent) == search_index + 2
+        client._handle_frame(
+            _frame(
+                {
+                    "URI": sent[search_index + 1][0],
+                    "messages": [
+                        {
+                            "requestId": sent[search_index + 1][1][0]["requestId"],
+                            "screenArguments": {"searchReady": True},
+                            "nodes": [{"displayType": "searchList", "title": "Fall"}],
+                        }
+                    ],
+                }
+            )
+        )
+        return await first
+
+    result = asyncio.run(run())
+    assert result["nodes"][0]["title"] == "Fall"
+
+
+@pytest.mark.parametrize("wrapper", ["refreshLMQ", "refreshLMQ3"])
+@pytest.mark.parametrize(
+    "case,matched",
+    [
+        ("valid", True),
+        ("wrong_to", False),
+        ("wrong_to_suffix", False),
+        ("stale", False),
+        ("root", False),
+        ("invalid_json", False),
+        ("raw_uuid", False),
+        ("raw_search", False),
+        ("json_string", False),
+        ("decoded_wrapper", False),
+        ("wrong_wrapper", False),
+        ("wrong_component", False),
+        ("wrong_logical", False),
+        ("wrong_state", False),
+        ("wrong_endpoint", False),
+        ("missing_to", False),
+        ("malformed_object", False),
+    ],
+)
+def test_search_music_refresh_json_matcher(monkeypatch, wrapper, case, matched):
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 1)
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_READY_TIMEOUT", 2)
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            assert uri.endswith("/search")
+            sent.append((uri, messages))
+            client._handle_frame(
+                _frame({"URI": uri, "messages": [{
+                    "requestId": messages[0]["requestId"],
+                    "screenArguments": {"searchReady": len(sent) > 1},
+                    "nodes": [],
+                }]})
+            )
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        task = asyncio.create_task(client.async_search_music("Music", "AVB Stream 5", "Fall"))
+        try:
+            await asyncio.sleep(0)
+            search_uuid = sent[0][1][0]["arguments"]["uuid"]
+            token = f"search`search:{search_uuid}" if wrapper == "refreshLMQ" else f"search:{search_uuid}"
+            payload = {"from": token, "to": token}
+            state = f"Music.AVB Stream 5.{wrapper}"
+            uri = "state/update"
+            if case == "wrong_to":
+                payload["to"] = token.replace(search_uuid, "stale")
+            elif case == "wrong_to_suffix":
+                payload["to"] = token + "-stale"
+            elif case == "stale":
+                payload = {"from": token.replace(search_uuid, "stale"), "to": token.replace(search_uuid, "stale")}
+            elif case == "root":
+                payload = {"from": f"root:{search_uuid}", "to": f"root:{search_uuid}"}
+            elif case == "missing_to":
+                payload.pop("to")
+            elif case == "malformed_object":
+                payload["to"] = {"uuid": search_uuid}
+            elif case == "wrong_component":
+                state = f"Other Music.AVB Stream 5.{wrapper}"
+            elif case == "wrong_logical":
+                state = f"Music.AVB Stream 6.{wrapper}"
+            elif case == "wrong_state":
+                state += ".extra"
+            elif case == "wrong_endpoint":
+                uri = "dis/userData/update"
+            value = json.dumps(payload if wrapper == "refreshLMQ" else [payload])
+            if case == "wrong_wrapper":
+                value = json.dumps([payload] if wrapper == "refreshLMQ" else payload)
+            elif case == "invalid_json":
+                value = '{"to":'
+            elif case == "raw_uuid":
+                value = search_uuid
+            elif case == "raw_search":
+                value = f"search:{search_uuid}"
+            elif case == "json_string":
+                value = json.dumps(token)
+            elif case == "decoded_wrapper":
+                value = payload if wrapper == "refreshLMQ" else [payload]
+            client._handle_frame(_frame({"URI": uri, "messages": [{"state": state, "value": value}]}))
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert len(sent) == (2 if matched else 1)
+            if matched:
+                assert (await task)["nodes"] == []
+            else:
+                assert not task.done()
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert not client._pending_music_search_refresh
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "screen_arguments,nodes",
+    [
+        (None, []),
+        ({}, []),
+        ({"searchReady": "true"}, []),
+        ({"searchReady": 1}, []),
+        ({"searchReady": None}, []),
+        ({"searchReady": True}, None),
+        ({"searchReady": True}, {}),
+        ({"searchReady": False}, {}),
+    ],
+)
+def test_search_music_rejects_malformed_readiness(screen_arguments, nodes):
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            assert uri.endswith("/search")
+            sent.append(uri)
+            client._handle_frame(_frame({"URI": uri, "messages": [{
+                "requestId": messages[0]["requestId"],
+                "screenArguments": screen_arguments,
+                "nodes": nodes,
+            }]}))
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        with pytest.raises(sc.SavantError):
+            await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    asyncio.run(run())
+    assert len(sent) == 1
+    assert not client._pending_music_search_refresh
+
+
+@pytest.mark.parametrize("wrapper", ["refreshLMQ", "refreshLMQ3"])
+def test_search_music_handles_early_refresh_and_repeated_pending(monkeypatch, wrapper):
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 1)
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_READY_TIMEOUT", 2)
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            assert uri.endswith("/search")
+            sent.append(messages[0])
+            search_uuid = messages[0]["arguments"]["uuid"]
+            token = f"search`search:{search_uuid}" if wrapper == "refreshLMQ" else f"search:{search_uuid}"
+            payload = {"from": token, "to": token}
+            # The refresh can arrive before its correlated pending RPC response.
+            client._handle_frame(_frame({"URI": "state/update", "messages": [{
+                "state": f"Music.AVB Stream 5.{wrapper}",
+                "value": json.dumps(payload if wrapper == "refreshLMQ" else [payload]),
+            }]}))
+            ready = len(sent) == 3
+            client._handle_frame(_frame({"URI": uri, "messages": [{
+                "requestId": messages[0]["requestId"],
+                "screenArguments": {"searchReady": ready},
+                "nodes": [{"title": "Fall"}] if ready else None,
+            }]}))
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        return await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    assert asyncio.run(run())["nodes"] == [{"title": "Fall"}]
+    assert len(sent) == 3
+    assert len({message["arguments"]["uuid"] for message in sent}) == 1
+    assert len({message["requestId"] for message in sent}) == 3
+    assert not client._pending_music_search_refresh
+
+
+def test_search_music_readiness_timeout_defaults():
+    assert sc.MUSIC_SEARCH_PENDING_WATCHDOG == 1
+    assert sc.MUSIC_SEARCH_READY_TIMEOUT == 30
+
+
+def test_search_music_caps_transmissions_at_six(monkeypatch):
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 0.001)
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_READY_TIMEOUT", 0.2)
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def run():
+        async def fake_request(uri, messages, *, include_identity):
+            assert uri.endswith("/search")
+            sent.append(messages[0])
+            client._handle_frame(_frame({"URI": uri, "messages": [{
+                "requestId": messages[0]["requestId"],
+                "screenArguments": {"searchReady": False},
+                "nodes": None,
+            }]}))
+
+        client._request_music = fake_request  # type: ignore[assignment]
+        with pytest.raises(sc.SavantError):
+            await client.async_search_music("Music", "AVB Stream 5", "Fall")
+
+    asyncio.run(run())
+    assert len(sent) == 6
+    assert len({message["arguments"]["uuid"] for message in sent}) == 1
+    assert len({message["requestId"] for message in sent}) == 6
+    assert not client._pending_music_search_refresh
+
+
+@pytest.mark.parametrize("retry_source", ["initial", "refresh", "watchdog"])
+def test_music_search_debug_trace_correlates_requests_and_timings(caplog, monkeypatch, retry_source):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    monkeypatch.setattr(sc, "MUSIC_SEARCH_PENDING_WATCHDOG", 0.01)
+    client = SavantClient("10.0.0.5", 12345)
+    sent = []
+
+    async def fake_request(uri, messages, *, include_identity):
+        message = messages[0]
+        sent.append(message)
+        ready = retry_source == "initial" or len(sent) == 2
+        client._handle_frame(_frame({"URI": uri, "messages": [{
+            "requestId": message["requestId"],
+            "screenArguments": {"searchReady": ready},
+            "nodes": [] if ready else None,
+        }]}))
+        if not ready and retry_source == "refresh":
+            marker = f"search:{message['arguments']['uuid']}"
+            client._handle_frame(_frame({"URI": "state/update", "messages": [{
+                "state": "Music.AVB Stream 5.refreshLMQ3",
+                "value": json.dumps([{"from": marker, "to": marker, "time": 1}]),
+            }]}))
+
+    client._request_music = fake_request
+    assert asyncio.run(client.async_search_music("Music", "AVB Stream 5", "Example"))["nodes"] == []
+    trace = caplog.text
+    assert "queue_wait_ms=" in trace
+    assert f"retry_source={retry_source}" in trace
+    assert "rpc_elapsed_ms=" in trace
+    assert "screen_type=dict nodes_type=list" in trace
+    assert "outcome=ready" in trace
+    assert "elapsed_ms=" in trace
+    assert f"correlation_id={sent[0]['arguments']['uuid']}" in trace
+    for message in sent:
+        assert f"request_id={message['requestId']}" in trace
+    if retry_source != "initial":
+        assert "wait_ms=" in trace
+        assert "nodes_type=NoneType" in trace
+    if retry_source == "refresh":
+        assert "matched=True" in trace
+
+
+def test_music_search_refresh_without_waiter_is_logged(caplog):
+    caplog.set_level("DEBUG", logger="custom_components.savant_ha")
+    client = SavantClient("10.0.0.5", 12345)
+    client._handle_music_search_refresh(
+        "Music.AVB Stream 5.refreshLMQ3",
+        json.dumps([{"from": "search:old", "to": "search:old", "time": 1}]),
+    )
+    assert "reason=no_local_waiter active_searches=0" in caplog.text
 
 
 if __name__ == "__main__":

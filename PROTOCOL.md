@@ -254,24 +254,68 @@ key and detect JPEG or PNG from the complete body. Trace-backed music controls a
 After `PowerOff`, the host can retain all metadata, pause, and progress values; use the
 room's exact `ActiveService`/comma-separated `ActiveServices` membership instead.
 
+For Home Assistant topology, canonical zoned-service rows are endpoint projections. The
+physical server identity comes from the row's exact `component` relationship to
+`ZoneConfigComponents` (preferring its stable `uid`/`componentID`/`internalID`), while
+the endpoint zone identity comes from `Rooms.roomID`. The per-room zoned-service `service`
+identifier remains the authoritative membership key in `ActiveService`/`ActiveServices`.
+These archive relationships, not display names, allow several room endpoints to be
+recognized as aliases of one server. The integration uses endpoint `PowerOff` then
+`PowerOn` under a per-server lock for exact route replacement; no whole-route replacement
+verb has been observed.
+
 Music browsing is a same-URI RPC under
 `music/<component>/<logical>/SVC_AV_SAVANTMUSIC/getRoot` and `/browse`. Captured requests
 use `{clientType:"iPhone",limit:50,offset:0,requestId,version:1,node,arguments:null}`;
 the response carries `{requestId,screenArguments,nodes}` on the same URI. For `/browse`,
 preserve the selected node's opaque routing fields, especially its JSON-encoded
 `arguments.item`, rather than deriving a request from its title. Nodes with
-`actionType:"browsable"` are folders; action-node playback effects are not verified.
+`actionType:"browsable"` are folders; `actionType:"action"` nodes can represent direct
+selection actions. Playlist-start captures specifically contain `music_icon_play` and
+`music_icon_shuffle` action nodes; submit those returned nodes through `/browse` rather
+than synthesizing a playlist request. For action submission, omit only presentation fields
+`displayType`, `children`, and `hasSubmenu`; preserve the returned routing fields and the
+JSON-encoded `arguments.item` string.
 Typed search is capture-verified on `/search` with `clientType:"android"`, no outer
 identity fields, and `arguments:{filter:"all",searchTerm,services:["plex","tunein",
-"amazonmusic","playlists"],uuid}`. An initial `{searchReady:false,nodes:[]}` means wait
+"amazonmusic","playlists"],uuid}`. An initial `{screenArguments:{searchReady:false},nodes:null}` means wait
 for `refreshLMQ` or `refreshLMQ3` containing that UUID, then repeat the same request with a
 new `requestId`. Search results are `displayType:"searchList"` nodes. Follow their captured
 `query:"browse"|"browseSearch"` on the matching endpoint; a recent-search track submitted
 to `/browse` produced matching `CurrentSongName`, `CurrentPauseStatus:false`, and elapsed-time
 state. Non-`all` filters and paging beyond `offset:0` remain unsupported.
+
+The sibling `MUSIC_SEARCH_INVESTIGATION.md` (commit `6750b23`) corrects earlier
+assumptions: `getRoot` reset semantics and single-active-search constraints are not
+established. Repeated-text results can return immediately without an intervening root.
+The former exact bare-UUID matcher in this integration rejected the captured refresh values;
+the absence of a matched event was not evidence that the host omitted notifications.
+
+Both exact `<component>.<logical>.refreshLMQ` and `.refreshLMQ3` keys carry JSON strings.
+`refreshLMQ` decodes to an object with `from`/`to` equal to
+`search` followed by a literal backtick followed by `search:<UUID>`.
+`refreshLMQ3` decodes to an array of objects with `from`/`to` equal to `search:<UUID>`.
+Match the complete destination marker and exact state key, not a substring or RPC requestId.
+Root refreshes and old/replayed search values must not release another search's waiter.
+On notification, repeat the typed request with the same UUID and a new requestId, without
+`getRoot`. A refresh is a retry hint, not proof that results are ready; validate the next
+RPC's boolean `searchReady` and nodes array. Null nodes with false readiness are pending.
+
+The per-client component/service lock is retained as conservative scheduling policy, not
+as a captured backend requirement. Independent components remain concurrent. Local fallback
+policy uses a one-second pending watchdog, at most six transmissions for the same UUID,
+and a 30-second overall budget; these bounds are not recovered native protocol constants.
+Repeated pending responses never become empty successful results. Exhaustion is reported as
+inconclusive readiness, not a proven provider rejection. No per-search `getRoot` is sent.
 Browse-node `artworkKey` values use the same `session/fileDownload` wrapper as now-playing art,
 with `type:"thumbnailArtwork"`; serve the returned JPEG or PNG through Home Assistant's browse-image
 proxy without exposing the opaque artwork key in media IDs.
+Home Assistant browse IDs are deterministic opaque hashes of the returned node, so repeated
+browse calls for an unchanged node return the same ID. Savant has no observed standard `Stop`
+verb; `media_player.media_stop` therefore returns a validation error rather than sending an
+invented request.
+There is no captured standalone shuffle setter. Home Assistant should expose shuffle-capable
+playlist action nodes through `BrowseMedia.can_play`, not advertise `SHUFFLE_SET`.
 The captured track selection followed an earlier Music `PowerOn`; selecting a track while its
 zone is off is not verified. Wait for the room's nonempty `ActiveService` state after `PowerOn`
 before submitting the track node. Provider/browser-session expiry behavior is not captured.
@@ -292,6 +336,16 @@ optimistically reflected until `ActiveService` changes.
 
 ### 5.6 Scenes
 Subscribe to dashboard state `scenesAndFoldersReduced` using `dis/dashboard/register`.
+The documented native scene subscription is a single-state envelope:
+`{URI:"dis/dashboard/register",messages:[{state:"scenesAndFoldersReduced"}]}`
+(outer identity fields vary by captured client). The native startup separately registers
+`RecentServices` in single-state frames. Preserve separate requests for the two states;
+the multi-state batching observed for `state/register` does not establish dashboard batching
+support (sibling `PROTOCOL.md` §6.7/§9.1, revision `7594101`). A reported host returned only
+`RecentServices` updates after a combined dashboard registration; first-entry-only host
+processing is a hypothesis, not capture-proven behavior.
+Follow-up logs still contained only `RecentServices` after separate single-state requests,
+so splitting the requests is not sufficient to resolve that reported scene-discovery failure.
 The initial `dis/dashboard/update` is the complete current scene-summary list; summaries
 include stable `id` and `name`, so integrations can reconcile scene entities as host scenes
 are created or removed. Creation was observed to push a replacement list. A deletion push
@@ -382,3 +436,17 @@ CoolMaster setter shapes and fan auto/cycle remain uncaptured and disabled.
    does not yet re-derive them from the state-key namespace.
 7. HVAC archive metadata supplies per-entity scale/range/capability flags on new imports;
    old persisted device records may require reconfiguration to acquire those fields.
+8. No mapping from Savant light/cover addresses to Caseta/RA2 Select device serial numbers has
+   been established. Import-time duplicate suggestions assume that an unambiguous exact
+   name-and-area match within the same entity domain may represent the same device;
+   this is overridable UI policy, not
+   recovered protocol identity. No Caseta backend is inferred from a state-key shape.
+   HA's loaded Lutron integration can supply cached load names without its generated
+   display hierarchy. Those names are joined to Lutron registry entities using HA's own
+   Lutron unique-ID rules, not by equating Savant addresses with Lutron identities.
+9. Some reported local-login sessions receive ordinary state and `RecentServices`, but no
+   `scenesAndFoldersReduced` inventory despite scenes being visible in the native app.
+   The documented successful scene subscription is not tied to an exact full outer
+   envelope or a same-account comparison with these sessions. Account/permission scope,
+   scene type, host-version differences, and preceding native requests remain unverified;
+   compare a fresh native session on the affected host before adding alternate requests.
