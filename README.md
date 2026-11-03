@@ -137,10 +137,36 @@ Lutron matching diagnostics are logged, even at DEBUG level.
 | Climate | `HVACEntities` | configured captured modes/setpoints and read-only CoolMaster state |
 | Cover | `ShadeEntities` | capture-backed shade open/close and position; stop is not captured |
 | Fan | `FanEntities` | exact per-device state, read-only |
-| Media Player | `ServiceImplementationZonedService` (one selectable source or Apple TV endpoint per room) | music: browsing, global catalog search, playback, now-playing, power, volume, transport, and album art; Apple TV: archive-declared power, volume, and play/pause |
+| Media Player (room) | one per room with imported sources | the room as Savant models it: state from `<room>.ActiveService`, room volume/mute, `source_list`/`select_source` over the room's sources, transport and now-playing from the active source, Music browse/search/play, and grouping of rooms on a shared music server via standard `media_player.join`/`unjoin` |
+| Media Player (per source) | `ServiceImplementationZonedService` (one selectable source or Apple TV endpoint per room) | music: browsing, global catalog search, playback, now-playing, power, volume, transport, and album art; Apple TV: archive-declared power, volume, and play/pause |
 | Scene | Savant dashboard `scenesAndFoldersReduced` updates | standalone native `scene.turn_on` activation |
 | Remote | each imported AV endpoint with a declared request list | `remote.send_command` for any archive-declared request; on/off via PowerOn/PowerOff |
 | Sensor / Binary sensor | `RoomCapabilities` rooms and imported AV endpoints | diagnostics: host connectivity, per-room active service/volume/zone flags, per-endpoint power/input/volume |
+
+## Room media players
+
+Savant's state is room-centric: each room reports the one service it is playing. The
+integration therefore creates a **room media player** (`<Room> Media`) on the same
+device as that room's diagnostic sensors:
+
+- **State** is the active source's state, or `off` when the room is idle.
+- **Source** lists the room's imported sources. Selecting one sends that source's
+  `PowerOn`, and Savant switches the room (the previous source deactivates itself).
+- **Turn on** restarts the room's `LastActiveService`, or the only source; with several
+  sources and no history it asks you to pick one instead of guessing.
+- **Volume / mute** are the room's own values, shown once rather than per source. They
+  are controllable while a source is active.
+- **Play/pause/skip, now-playing and artwork** come from the active source.
+  **Browse/search/play media** go to the room's Savant Music source, which powers itself
+  on before playback.
+- **Grouping**: when the active source is a shared music server, `group_members` lists
+  the rooms listening to it, and `media_player.join` / `unjoin` select or deselect that
+  server in other rooms (using the routing described below).
+
+The per-source media players remain: they do the actual work and keep the routing below
+exact. New installs register them **hidden** (not disabled), so they stay usable from
+automations and the entity list without cluttering auto-generated dashboards. Entities
+that already exist keep their current visibility.
 
 ## Shared media-server routing
 

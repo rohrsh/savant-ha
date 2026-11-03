@@ -46,6 +46,7 @@ from .const import (
 )
 from .mdns import async_savant_mdns_hosts
 from .media_routing import MediaRouteManager, opaque_model_id
+from .room_media import room_sources
 from .savant_client import SavantClient
 
 
@@ -136,6 +137,7 @@ class SavantHub:
         self._flush_scheduled = False
         self._task: asyncio.Task | None = None
         self._media_routes = MediaRouteManager()
+        self._room_media_entities: dict[str, str] = {}
 
         data = dict(entry.data)
         options = dict(entry.options or {})
@@ -341,6 +343,30 @@ class SavantHub:
 
     def media_entity(self, entity_id: str) -> Any | None:
         return self._media_routes.entity(entity_id)
+
+    def media_entities(self) -> dict[str, Any]:
+        """Every registered per-source media entity, keyed by HA entity ID."""
+        return self._media_routes.entities()
+
+    def room_media_sources(self, room: str) -> list[Any]:
+        """The registered per-source media entities of one room (room_media.py)."""
+        return room_sources(self._media_routes.entities().values(), room)
+
+    def register_room_media_entity(self, room: str, entity_id: str) -> None:
+        self._room_media_entities[room] = entity_id
+
+    def unregister_room_media_entity(self, room: str) -> None:
+        self._room_media_entities.pop(room, None)
+
+    def room_media_entity_id(self, room: str) -> str | None:
+        return self._room_media_entities.get(room)
+
+    def room_for_media_entity(self, entity_id: str) -> str | None:
+        """Return the room whose room media player has this entity ID."""
+        return next(
+            (room for room, eid in self._room_media_entities.items() if eid == entity_id),
+            None,
+        )
 
     def media_server_entities(self, media_server_id: str) -> list[Any]:
         return self._media_routes.server_entities(media_server_id)

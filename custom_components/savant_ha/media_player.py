@@ -1,4 +1,16 @@
-"""Media player platform: one entity per selectable Savant music source."""
+"""Media player platform.
+
+Two views of the same Savant state:
+
+* **Room media players** — one per room, mirroring Savant's room-centric state
+  (``<room>.ActiveService``/``CurrentVolume``/``IsMuted``). ``source_list`` holds the
+  room's imported sources; selecting one powers it on, grouping follows the shared
+  media server. Selection rules live in ``room_media.py``.
+* **Per-source media players** — one per archive AV endpoint in a room ("source X in
+  room Y"). They carry the controls and routing the room view delegates to, and are
+  hidden (not disabled) by default once a room view exists, so they keep working for
+  routing and automations without cluttering dashboards.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +62,13 @@ from .media_routing import (
     media_action_title,
     opaque_model_id,
     stable_media_node_id,
+)
+from .room_media import (
+    active_source,
+    group_member_rooms,
+    join_targets,
+    source_names,
+    turn_on_source,
 )
 from .savant_client import SavantError, image_content_type
 
@@ -112,6 +131,11 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
                 VERB_SEEK,
             }
         self._attr_unique_id = f"{hub.uid}_media_{device['id']}"
+        if self._room and hub.devices is not None:
+            # The room media player is the primary view; keep this projection live
+            # (routing needs it registered) but off auto-generated dashboards. Only
+            # applies when the entity is first registered.
+            self._attr_entity_registry_visible_default = False
         self._last_media_position: float | None = None
         self._media_position_updated_at: datetime | None = None
         self._artwork_key: str | None = None
@@ -737,6 +761,291 @@ class SavantMediaPlayer(SavantEntity, MediaPlayerEntity):
         return self._service_id in services if self._service_id else bool(services)
 
 
+_ROOM_DELEGATED_FEATURES = (
+    MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_STEP
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.STOP
+    | MediaPlayerEntityFeature.NEXT_TRACK
+    | MediaPlayerEntityFeature.PREVIOUS_TRACK
+    | MediaPlayerEntityFeature.SEEK
+)
+_ROOM_MUSIC_FEATURES = (
+    MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.SEARCH_MEDIA
+    | MediaPlayerEntityFeature.PLAY_MEDIA
+)
+
+
+class SavantRoomMediaPlayer(SavantEntity, MediaPlayerEntity):
+    """One Savant room: its active source, room volume/mute, and source selection."""
+
+    _attr_name = "Media"
+
+    def __init__(self, hub: SavantHub, room: str) -> None:
+        # Same HA device as the room diagnostic sensors (sensor.py ``room:<room>``).
+        super().__init__(hub, device_key=f"room:{room}", device_name=room, area=room)
+        self._room = room
+        self._attr_unique_id = (
+            f"{hub.uid}_room_media_{opaque_model_id('room', room).split(':', 1)[1]}"
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self.entity_id:
+            self.hub.register_room_media_entity(self._room, self.entity_id)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self.hub.unregister_room_media_entity(self._room)
+        await super().async_will_remove_from_hass()
+
+    # ------------------------------------------------------------- resolution
+
+    def _sources(self) -> list[SavantMediaPlayer]:
+        return self.hub.room_media_sources(self._room)
+
+    def _active(self) -> SavantMediaPlayer | None:
+        return active_source(self._sources())
+
+    def _music(self) -> SavantMediaPlayer | None:
+        """The source that browse/search/play_media go to: active Music, else Music."""
+        active = self._active()
+        if active is not None and active._service_type == SVC_AV_SAVANTMUSIC:
+            return active
+        return next(
+            (s for s in self._sources() if s._service_type == SVC_AV_SAVANTMUSIC), None
+        )
+
+    def _require_active(self) -> SavantMediaPlayer:
+        if (active := self._active()) is None:
+            raise ServiceValidationError(f"{self._room} has no active Savant source")
+        return active
+
+    # ----------------------------------------------------------------- state
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self._sources())
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        active = self._active()
+        if active is None:
+            return MediaPlayerState.OFF
+        state = active.state
+        # The room asserts the source is active even if the source's own transport
+        # state has not caught up yet.
+        return state if state not in (None, MediaPlayerState.OFF) else MediaPlayerState.ON
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        features = (
+            MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.SELECT_SOURCE
+        )
+        if (active := self._active()) is not None:
+            features |= active.supported_features & _ROOM_DELEGATED_FEATURES
+            if active.savant_shared_media_server:
+                features |= MediaPlayerEntityFeature.GROUPING
+        if (music := self._music()) is not None:
+            features |= music.supported_features & _ROOM_MUSIC_FEATURES
+        return features
+
+    @property
+    def source_list(self) -> list[str]:
+        return list(source_names(self._sources()))
+
+    @property
+    def source(self) -> str | None:
+        active = self._active()
+        if active is None:
+            return None
+        return next(
+            (name for name, s in source_names(self._sources()).items() if s is active), None
+        )
+
+    @property
+    def volume_level(self) -> float | None:
+        value = coerce_number(self._state(f"{self._room}.CurrentVolume"))
+        if value is not None:
+            return max(0.0, min(1.0, value / _RAW_VOLUME_MAX))
+        active = self._active()
+        return active.volume_level if active is not None else None
+
+    @property
+    def is_volume_muted(self) -> bool | None:
+        value = self._state(f"{self._room}.IsMuted")
+        if isinstance(value, bool):
+            return value
+        if (number := coerce_number(value)) is not None:
+            return bool(number)
+        active = self._active()
+        return active.is_volume_muted if active is not None else None
+
+    def _from_active(self, attr: str) -> object:
+        active = self._active()
+        return getattr(active, attr) if active is not None else None
+
+    @property
+    def media_title(self) -> str | None:
+        return self._from_active("media_title")
+
+    @property
+    def media_artist(self) -> str | None:
+        return self._from_active("media_artist")
+
+    @property
+    def media_album_name(self) -> str | None:
+        return self._from_active("media_album_name")
+
+    @property
+    def media_content_type(self) -> str | None:
+        return self._from_active("media_content_type")
+
+    @property
+    def media_position(self) -> float | None:
+        return self._from_active("media_position")
+
+    @property
+    def media_duration(self) -> float | None:
+        return self._from_active("media_duration")
+
+    @property
+    def media_position_updated_at(self) -> datetime | None:
+        return self._from_active("media_position_updated_at")
+
+    @property
+    def media_image_hash(self) -> str | None:
+        return self._from_active("media_image_hash")
+
+    async def async_get_media_image(self) -> tuple[bytes | None, str | None]:
+        active = self._active()
+        if active is None:
+            return None, None
+        return await active.async_get_media_image()
+
+    @property
+    def group_members(self) -> list[str] | None:
+        active = self._active()
+        if active is None or not active.savant_shared_media_server:
+            return None
+        rooms = group_member_rooms(
+            active.savant_selected_zone_entity_ids, self.hub.media_entities()
+        )
+        members = [
+            entity_id
+            for room in rooms
+            if (entity_id := self.hub.room_media_entity_id(room)) is not None
+        ]
+        return members or None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        active = self._active()
+        return {
+            "savant_active_source_entity_id": active.entity_id if active else None,
+            "savant_source_entity_ids": {
+                name: source.entity_id for name, source in source_names(self._sources()).items()
+            },
+        }
+
+    # -------------------------------------------------------------- commands
+
+    async def async_select_source(self, source: str) -> None:
+        target = source_names(self._sources()).get(source)
+        if target is None:
+            raise ServiceValidationError(f"Unknown source for {self._room}: {source}")
+        await target.async_turn_on()
+        self.async_write_ha_state()
+
+    async def async_turn_on(self) -> None:
+        sources = self._sources()
+        if active_source(sources) is not None:
+            return
+        target = turn_on_source(sources, self._state(f"{self._room}.LastActiveService"))
+        if target is None:
+            raise ServiceValidationError(
+                f"Choose a source for {self._room} (media_player.select_source)"
+            )
+        await target.async_turn_on()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self) -> None:
+        if (active := self._active()) is not None:
+            await active.async_turn_off()
+            self.async_write_ha_state()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        await self._require_active().async_set_volume_level(volume)
+        self.async_write_ha_state()
+
+    async def async_volume_up(self) -> None:
+        await self._require_active().async_volume_up()
+
+    async def async_volume_down(self) -> None:
+        await self._require_active().async_volume_down()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        await self._require_active().async_mute_volume(mute)
+        self.async_write_ha_state()
+
+    async def async_media_play(self) -> None:
+        await self._require_active().async_media_play()
+
+    async def async_media_pause(self) -> None:
+        await self._require_active().async_media_pause()
+
+    async def async_media_stop(self) -> None:
+        await self._require_active().async_media_stop()
+
+    async def async_media_next_track(self) -> None:
+        await self._require_active().async_media_next_track()
+
+    async def async_media_previous_track(self) -> None:
+        await self._require_active().async_media_previous_track()
+
+    async def async_media_seek(self, position: float) -> None:
+        await self._require_active().async_media_seek(position)
+
+    def _require_music(self) -> SavantMediaPlayer:
+        if (music := self._music()) is None:
+            raise ServiceValidationError(f"{self._room} has no Savant Music source")
+        return music
+
+    async def async_browse_media(self, *args: object, **kwargs: object) -> BrowseMedia:
+        return await self._require_music().async_browse_media(*args, **kwargs)
+
+    async def async_search_media(self, *args: object, **kwargs: object) -> SearchMedia:
+        return await self._require_music().async_search_media(*args, **kwargs)
+
+    async def async_play_media(self, *args: object, **kwargs: object) -> None:
+        # The Music source powers itself on before playback, switching the room.
+        await self._require_music().async_play_media(*args, **kwargs)
+        self.async_write_ha_state()
+
+    async def async_join_players(self, group_members: list[str]) -> None:
+        anchor = self._require_active()
+        rooms = []
+        for entity_id in group_members:
+            room = self.hub.room_for_media_entity(entity_id)
+            if room is None:
+                raise ServiceValidationError(f"Not a Savant room media player: {entity_id}")
+            rooms.append(room)
+        try:
+            targets = join_targets(anchor, rooms, self.hub.media_entities().values())
+        except ValueError as err:
+            raise ServiceValidationError(str(err)) from err
+        await anchor.async_join_players(targets)
+        self.async_write_ha_state()
+
+    async def async_unjoin_player(self) -> None:
+        await self._require_active().async_unjoin_player()
+        self.async_write_ha_state()
+
+
 def _discovered_zones(hub: SavantHub) -> set[int]:
     zones: set[int] = set()
     marker = MUSIC_ZONE_PREFIX
@@ -755,17 +1064,20 @@ def _logical_component(device: dict[str, object]) -> str | None:
     return str(device.get("zone") or "") or audio_zone_logical_component(device)
 
 
-def _build_entities(hub: SavantHub) -> list[SavantMediaPlayer]:
+def _build_entities(hub: SavantHub) -> list[MediaPlayerEntity]:
     if hub.devices is not None:
         media = [d for d in hub.devices if d.get("type") == DEVICE_TYPE_MEDIA_PLAYER]
-        entities: list[SavantMediaPlayer] = []
+        entities: list[MediaPlayerEntity] = []
+        rooms: list[str] = []
         for device in media:
             logical_component = _logical_component(device)
             component = str(device.get("component") or "Music")
             if logical_component:
-                entities.append(
-                    SavantMediaPlayer(hub, device, component, logical_component)
-                )
+                source = SavantMediaPlayer(hub, device, component, logical_component)
+                entities.append(source)
+                if source._room and source._room not in rooms:
+                    rooms.append(source._room)
+        entities.extend(SavantRoomMediaPlayer(hub, room) for room in rooms)
         return entities
     return [
         SavantMediaPlayer(

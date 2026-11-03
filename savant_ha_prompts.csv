@@ -1337,3 +1337,6 @@ perhaps his media work duplicates some of mine? Check for conflicts before blind
 
 for my personal situation it's likely only media entities that I want. I'd like a config flow that chooses which domains"
 1793684861157,2026-11-03T05:47:41.159Z,flagged,Flagged changes,"RESOLVED, NOT A PROMPT: the flagged media-only PLATFORMS trim in custom_components/savant_ha/__init__.py (row 2026-10-08 'Flagged changes') is removed. PLATFORMS is the full list again and the config-flow 'domains' step (prompt above: 'I'd like a config flow that chooses which domains') now selects the forwarded platforms per entry, so the '# NOTE: unprompted change' marker is gone."
+1793686170205,2026-11-03T06:09:30.208Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Room media players (option C),"Room based entities I think reflects the underlying Savant state data, so I wouldn't abandon it
+
+So lets go towards C. Might even be welcomed upstream if we do it right."

@@ -106,6 +106,10 @@ class MediaRouteManager:
     def entity(self, entity_id: str) -> MediaRouteEndpoint | None:
         return self._entities.get(entity_id)
 
+    def entities(self) -> dict[str, MediaRouteEndpoint]:
+        """Return every registered projected endpoint keyed by HA entity ID."""
+        return dict(self._entities)
+
     def server_entities(self, media_server_id: str) -> list[MediaRouteEndpoint]:
         return [
             entity
