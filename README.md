@@ -310,6 +310,29 @@ Refreshes with `reason=no_local_waiter` have no matching active search in this c
 their arrival alone does not measure HA search latency. Logs include search terms, so
 review them for private information before sharing.
 
+## Live check (no Home Assistant needed)
+
+`tools/savant_live_check.py` logs in to your host with the integration's own client,
+lists each room's sources (with the `<Room> Media` names), then records room and source
+state while you use the Savant app, and reports:
+
+- **Q1** whether switching a room from source A to B deactivates A,
+- **Q2** whether the host reports `LastActiveService` (used by room turn-on),
+- **Q3** whether active-service IDs match the imported sources.
+
+```bash
+pip install aiohttp msgpack
+```
+
+```bash
+python tools/savant_live_check.py --host <HOST_IP> --user <LOCAL_USER>
+```
+
+Add `--exercise <Room> "<Source A>" "<Source B>"` to have the script itself play A,
+switch to B and turn the room off (it asks first). The password comes from
+`$SAVANT_PASSWORD` or a prompt. The JSONL recording omits host address, homeId, UIDs
+and credentials but does contain room/source names; it is git-ignored.
+
 ## Development
 
 Provenance rules — this repo's `AGENTS.md` — are mandatory: every change must be paired

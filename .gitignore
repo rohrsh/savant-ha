@@ -20,3 +20,5 @@ config/
 captures/
 *.pcap
 *.log.DS_Store
+# Live-checker recordings contain room/source names from a real house
+savant_live_check_*.jsonl
