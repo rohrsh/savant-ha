@@ -309,6 +309,8 @@ def test_reconfigure_preserves_previously_imported_cover(flow_module, cover_flow
         authorized=True, devices=[object()],
     )))
     result = asyncio.run(cover_flow.async_step_reconfigure({"username": "test", "password": "test"}))
+    assert result["step_id"] == "domains"
+    result = asyncio.run(cover_flow.async_step_domains({"domains": list(cover_flow._available_domains())}))
     assert result["step_id"] == "lutron"
     result = asyncio.run(cover_flow.async_step_lutron({"lutron_action": "include"}))
     assert result["step_id"] == "reconfigure_devices"
@@ -324,6 +326,8 @@ def test_new_import_prompts_before_picker_and_saves_the_choice(flow_module, flow
         authorized=True, devices=[object()],
     )))
     result = asyncio.run(flow.async_step_login({"username": "test", "password": "test"}))
+    assert result["step_id"] == "domains"
+    result = asyncio.run(flow.async_step_domains({"domains": list(flow._available_domains())}))
     assert result["type"] == "form"
     assert result["step_id"] == "lutron"
     choice = next(iter(result["data_schema"].schema.values()))
@@ -366,6 +370,8 @@ def test_reconfigure_choice_applies_to_previously_imported_duplicates(flow_modul
         authorized=True, devices=[object()],
     )))
     result = asyncio.run(flow.async_step_reconfigure({"username": "test", "password": "test"}))
+    assert result["step_id"] == "domains"
+    result = asyncio.run(flow.async_step_domains({"domains": list(flow._available_domains())}))
     assert result["step_id"] == "lutron"
     result = asyncio.run(flow.async_step_lutron({"lutron_action": "exclude" if exclude else "include"}))
     assert result["step_id"] == "reconfigure_devices"
@@ -468,9 +474,120 @@ def test_coolmaster_and_lutron_prompts_both_precede_the_picker(flow_module, flow
         authorized=True, devices=[object()],
     )))
     result = asyncio.run(flow.async_step_login({"username": "test", "password": "test"}))
+    assert result["step_id"] == "domains"
+    result = asyncio.run(flow.async_step_domains({"domains": list(flow._available_domains())}))
     assert result["step_id"] == "coolmaster"
     result = asyncio.run(flow.async_step_coolmaster({"coolmaster_action": "continue"}))
     assert result["step_id"] == "lutron"
     result = asyncio.run(flow.async_step_lutron({"lutron_action": "exclude"}))
     assert result["step_id"] == "devices"
     assert result["data_schema"]({}) == {"devices": ["climate-1"]}
+
+
+# ---- Import-domain selection ------------------------------------------------
+
+def _mixed_inventory():
+    return [
+        {"type": "light", "id": "savant-1", "name": "Ceiling", "area": "Kitchen"},
+        {"type": "media_player", "id": "media-1", "name": "Music", "area": "Kitchen"},
+        {"type": "media_player", "id": "media-2", "name": "Apple TV", "area": "Study"},
+        {
+            "type": "climate", "id": "climate-1", "name": "Thermostat",
+            "state_name": "CoolMaster.HVAC.ThermostatCurrentTemperature_1_001",
+        },
+        {"type": "room", "id": "room:1", "name": "Kitchen", "area": "Kitchen"},
+    ]
+
+
+def _login_to_domains(flow_module, flow, monkeypatch, devices):
+    monkeypatch.setattr(flow_module, "_devices_from_info", lambda probe: devices)
+    monkeypatch.setattr(flow_module, "probe_host", AsyncMock(return_value=SimpleNamespace(
+        authorized=True, devices=[object()],
+    )))
+    return asyncio.run(flow.async_step_login({"username": "test", "password": "test"}))
+
+
+def test_domains_step_offers_present_groups_with_counts(flow_module, flow, monkeypatch):
+    result = _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    assert result["step_id"] == "domains"
+    choice = next(iter(result["data_schema"].schema.values()))
+    assert choice.config["multiple"] is True
+    assert [(o["value"], o["label"]) for o in choice.config["options"]] == [
+        ("media_player", "Media players and AV remotes (2)"),
+        ("light", "Lights (1)"),
+        ("climate", "Climate (1)"),
+        ("scene", "Savant scenes"),
+        ("diagnostics", "Room and endpoint diagnostic sensors (1)"),
+    ]
+    # New imports default to every offered group.
+    assert result["data_schema"]({}) == {
+        "domains": ["media_player", "light", "climate", "scene", "diagnostics"]
+    }
+
+
+def test_media_only_skips_coolmaster_and_lutron_and_saves_choice(flow_module, flow, monkeypatch):
+    _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    result = asyncio.run(flow.async_step_domains({"domains": ["media_player"]}))
+    # The CoolMaster climate and the Lutron-matching light are out of scope, so
+    # neither coexistence prompt is shown.
+    assert result["step_id"] == "devices"
+    assert result["data_schema"]({}) == {"devices": ["media-1", "media-2"]}
+    result = asyncio.run(flow.async_step_devices({"devices": ["media-1", "media-2", "savant-1"]}))
+    assert result["type"] == "create_entry"
+    assert [d["id"] for d in result["data"]["devices"]] == ["media-1", "media-2"]
+    assert result["data"]["domains"] == ["media_player"]
+    # Routing topology still covers every archive media endpoint.
+    assert [d["id"] for d in result["data"]["media_topology"]] == ["media-1", "media-2"]
+
+
+def test_climate_choice_still_offers_coolmaster(flow_module, flow, monkeypatch):
+    _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    result = asyncio.run(flow.async_step_domains({"domains": ["climate"]}))
+    assert result["step_id"] == "coolmaster"
+
+
+def test_light_choice_still_offers_lutron(flow_module, flow, monkeypatch):
+    _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    result = asyncio.run(flow.async_step_domains({"domains": ["light"]}))
+    assert result["step_id"] == "lutron"
+
+
+def test_empty_domain_choice_is_rejected(flow_module, flow, monkeypatch):
+    _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    result = asyncio.run(flow.async_step_domains({"domains": []}))
+    assert result["step_id"] == "domains"
+    assert result["errors"] == {"base": "no_domains"}
+    # Unknown groups cannot be smuggled in either.
+    result = asyncio.run(flow.async_step_domains({"domains": ["lock"]}))
+    assert result["errors"] == {"base": "no_domains"}
+
+
+def test_scene_only_import_needs_no_devices(flow_module, flow, monkeypatch):
+    _login_to_domains(flow_module, flow, monkeypatch, _mixed_inventory())
+    result = asyncio.run(flow.async_step_domains({"domains": ["scene"]}))
+    assert result["step_id"] == "devices"
+    result = asyncio.run(flow.async_step_devices({}))
+    assert result["data"]["devices"] == []
+    assert result["data"]["domains"] == ["scene"]
+
+
+def test_reconfigure_defaults_to_stored_domains(flow_module, flow, monkeypatch):
+    entry = SimpleNamespace(data={"devices": [], "domains": ["media_player"]})
+    flow._get_reconfigure_entry = lambda: entry
+    flow._discover_configured_entry = AsyncMock(return_value=SimpleNamespace(
+        host="example.invalid", port=12345, home_id="",
+    ))
+    monkeypatch.setattr(flow_module, "_devices_from_info", lambda probe: _mixed_inventory())
+    monkeypatch.setattr(flow_module, "probe_host", AsyncMock(return_value=SimpleNamespace(
+        authorized=True, devices=[object()],
+    )))
+    result = asyncio.run(flow.async_step_reconfigure({"username": "test", "password": "test"}))
+    assert result["step_id"] == "domains"
+    assert result["data_schema"]({}) == {"domains": ["media_player"]}
+    result = asyncio.run(flow.async_step_domains({"domains": ["media_player", "diagnostics"]}))
+    assert result["step_id"] == "reconfigure_devices"
+    result = asyncio.run(flow.async_step_reconfigure_devices({"devices": ["media-1", "room:1"]}))
+    assert result["reason"] == "reconfigure_successful"
+    data = flow.hass.config_entries.async_update_entry.call_args.kwargs["data"]
+    assert data["domains"] == ["media_player", "diagnostics"]
+    assert [d["id"] for d in data["devices"]] == ["media-1", "room:1"]

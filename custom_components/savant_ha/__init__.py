@@ -16,7 +16,7 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 
-from .const import CONF_UID, DOMAIN, new_uid
+from .const import CONF_UID, DOMAIN, new_uid, platforms_for_domains, selected_domains
 from .hub import SavantHub
 
 SERVICE_SERVICE_REQUEST = "service_request"
@@ -36,6 +36,8 @@ SERVICE_REQUEST_SCHEMA = vol.Schema(
     }
 )
 
+# Every platform the integration can provide. Each entry forwards only the
+# platforms of its selected import groups (config-flow "domains" step).
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.CLIMATE,
@@ -55,6 +57,11 @@ SET_MEDIA_SERVER_ZONES_SCHEMA = vol.Schema(
         vol.Required(ATTR_ZONE_ENTITY_IDS): vol.All(cv.ensure_list, [cv.entity_id]),
     }
 )
+
+
+def entry_platforms(entry: ConfigEntry) -> list[Platform]:
+    """Return the platforms for the entry's selected import groups."""
+    return [Platform(name) for name in platforms_for_domains(selected_domains(entry.data))]
 
 
 def _get_hub(hass: HomeAssistant, entry: ConfigEntry) -> SavantHub:
@@ -166,7 +173,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hub.coordinator.async_config_entry_first_refresh()
     await hub.start()
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    hub.platforms = entry_platforms(entry)
+    await hass.config_entries.async_forward_entry_setups(entry, hub.platforms)
 
     async def _async_stop(_event: Event) -> None:
         await hub.stop()
@@ -180,9 +188,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    hub = _get_hub(hass, entry)
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        entry, hub.platforms or PLATFORMS
+    )
     if unload_ok:
-        hub = _get_hub(hass, entry)
         await hub.stop()
         hass.data[DOMAIN].pop(entry.entry_id)
     return unload_ok

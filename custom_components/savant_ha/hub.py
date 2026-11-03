@@ -143,6 +143,8 @@ class SavantHub:
         # The approved device list from the config-flow picker (None for legacy entries
         # that predate the picker — platforms then fall back to dynamic discovery).
         self.devices: list[dict[str, Any]] | None = data.get(CONF_DEVICES)
+        # Platforms forwarded for the entry's selected import groups (set at setup).
+        self.platforms: list[Any] | None = None
         self.media_topology_complete = CONF_MEDIA_TOPOLOGY in data
         self._media_topology: list[dict[str, Any]] = data.get(CONF_MEDIA_TOPOLOGY) or []
         # Known rooms: the room each approved device lives in + user-supplied override

@@ -1,13 +1,15 @@
 """Config flow for the Savant integration.
 
-Three steps, matching the standard device-import UX:
+Four steps, matching the standard device-import UX:
 
 1. **user** / **zeroconf** — UDP discovery resolves the host's stable ``UID`` and
    current control endpoint. mDNS discoveries skip the address prompt.
 2. **login** — the host-local account (``{user, password}``, PROTOCOL.md §4.1). The
    integration connects, authenticates, downloads the config archive, and enumerates
    the device inventory (PROTOCOL.md §13).
-3. **devices** — the collected devices (lights / thermostats / shades / fans / AV
+3. **domains** — which import groups (media players, lights, climate, …) to bring
+   in; the remaining steps and the forwarded platforms follow this choice.
+4. **devices** — the collected devices (lights / thermostats / shades / fans / AV
    zones / …), each with an area override. On accept, the entry is created with the
    approved device list.
 """
@@ -33,6 +35,7 @@ from .const import (
     CONF_CLOUD_TOKEN,
     CONF_CONFIGURATION_ID,
     CONF_DEVICES,
+    CONF_DOMAINS,
     CONF_HOME_ID,
     CONF_HOST_TOKEN,
     CONF_HOST_UID,
@@ -43,7 +46,11 @@ from .const import (
     DEVICE_TYPE_LIGHT,
     DEVICE_TYPE_MEDIA_PLAYER,
     DOMAIN,
+    IMPORT_DOMAIN_SCENE,
+    IMPORT_DOMAINS,
     LOGGER,
+    device_types_for_domains,
+    selected_domains,
 )
 from .coolmaster import exclude_duplicate_coolmaster_devices, is_coolmaster_climate
 from .lutron import find_duplicate_lutron_devices
@@ -183,6 +190,8 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._username: str = ""
         self._password: str = ""
         self._devices: list[dict[str, Any]] = []
+        self._all_devices: list[dict[str, Any]] = []
+        self._domains: list[str] | None = None
         self._lutron_duplicates: dict[str, str] = {}
         self._exclude_lutron: bool | None = None
         self._media_topology: list[dict[str, Any]] | None = None
@@ -257,34 +266,104 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "invalid_auth" if probe.auth_response_seen else "no_auth_response"
                 )
             else:
-                self._devices = _devices_from_info(probe)
-                self._lutron_duplicates = self._find_lutron_duplicates()
-                self._exclude_lutron = None
-                self._media_topology = (
-                    [
-                        dict(device)
-                        for device in self._devices
-                        if device["type"] == DEVICE_TYPE_MEDIA_PLAYER
-                    ]
-                    if probe.devices
-                    else None
-                )
-                if self._coolmaster_entries():
-                    self._devices = exclude_duplicate_coolmaster_devices(
-                        self._devices, self._coolmaster_climate_names()
-                    )
-                elif any(is_coolmaster_climate(device) for device in self._devices):
-                    return await self.async_step_coolmaster()
-                if not self._devices:
+                self._set_inventory(_devices_from_info(probe), bool(probe.devices))
+                if not self._all_devices:
                     errors["base"] = "no_devices"
                 else:
-                    return await self.async_step_devices()
+                    return await self.async_step_domains()
 
         return self.async_show_form(
             step_id="login",
             data_schema=_LOGIN_SCHEMA,
             errors=errors,
             description_placeholders={"host": self._host, "name": self._name or self._host},
+        )
+
+    def _set_inventory(self, devices: list[dict[str, Any]], from_archive: bool) -> None:
+        """Hold the host's full inventory until the domains step filters it."""
+        self._all_devices = devices
+        self._devices = list(devices)
+        self._lutron_duplicates = {}
+        self._exclude_lutron = None
+        # Routing needs every archive media endpoint, whatever the user imports.
+        self._media_topology = (
+            [dict(device) for device in devices if device["type"] == DEVICE_TYPE_MEDIA_PLAYER]
+            if from_archive
+            else None
+        )
+
+    def _available_domains(self) -> dict[str, int]:
+        """Import groups offered for this inventory, with their device counts.
+
+        Scenes are always offered: they arrive as dashboard pushes after setup, so
+        the archive inventory cannot say whether the host has any.
+        """
+        counts: dict[str, int] = {}
+        for domain, (_label, _platforms, device_types) in IMPORT_DOMAINS.items():
+            count = sum(1 for d in self._all_devices if d.get("type") in device_types)
+            if count or domain == IMPORT_DOMAIN_SCENE:
+                counts[domain] = count
+        return counts
+
+    def _domains_schema(self, available: dict[str, int], default: list[str]) -> vol.Schema:
+        options = [
+            {
+                "value": domain,
+                "label": IMPORT_DOMAINS[domain][0]
+                + ("" if domain == IMPORT_DOMAIN_SCENE else f" ({count})"),
+            }
+            for domain, count in available.items()
+        ]
+        return vol.Schema(
+            {
+                vol.Required(CONF_DOMAINS, default=default): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options, multiple=True, mode=selector.SelectSelectorMode.LIST
+                    )
+                )
+            }
+        )
+
+    async def async_step_domains(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Choose which import groups (HA domains) to bring in from this host."""
+        errors: dict[str, str] = {}
+        available = self._available_domains()
+        if user_input is not None:
+            requested = set(user_input.get(CONF_DOMAINS) or [])
+            chosen = [domain for domain in available if domain in requested]
+            if not chosen:
+                errors["base"] = "no_domains"
+            else:
+                self._domains = chosen
+                types = device_types_for_domains(chosen)
+                self._devices = [d for d in self._all_devices if d.get("type") in types]
+                self._lutron_duplicates = self._find_lutron_duplicates()
+                self._exclude_lutron = None
+                if self._coolmaster_entries():
+                    self._devices = exclude_duplicate_coolmaster_devices(
+                        self._devices, self._coolmaster_climate_names()
+                    )
+                elif self._reconfigure_entry is None and any(
+                    is_coolmaster_climate(device) for device in self._devices
+                ):
+                    return await self.async_step_coolmaster()
+                if not self._devices and IMPORT_DOMAIN_SCENE not in chosen:
+                    errors["base"] = "no_devices"
+                else:
+                    return await self._async_device_picker()
+
+        if self._reconfigure_entry is not None:
+            default = [
+                d for d in selected_domains(self._reconfigure_entry.data) if d in available
+            ]
+        else:
+            default = list(available)
+        return self.async_show_form(
+            step_id="domains",
+            data_schema=self._domains_schema(available, default or list(available)),
+            errors=errors,
         )
 
     async def async_step_coolmaster(
@@ -369,6 +448,7 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_USERNAME: self._username,
                 CONF_PASSWORD: self._password,
                 CONF_DEVICES: approved,
+                CONF_DOMAINS: self._domains or list(IMPORT_DOMAINS),
             }
             if self._media_topology is not None:
                 data[CONF_MEDIA_TOPOLOGY] = self._media_topology
@@ -415,24 +495,9 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "invalid_auth" if probe.auth_response_seen else "no_auth_response"
                 )
             else:
-                self._devices = _devices_from_info(probe)
-                self._lutron_duplicates = self._find_lutron_duplicates()
-                self._exclude_lutron = None
-                self._media_topology = (
-                    [
-                        dict(device)
-                        for device in self._devices
-                        if device["type"] == DEVICE_TYPE_MEDIA_PLAYER
-                    ]
-                    if probe.devices
-                    else None
-                )
-                if self._coolmaster_entries():
-                    self._devices = exclude_duplicate_coolmaster_devices(
-                        self._devices, self._coolmaster_climate_names()
-                    )
-                if self._devices:
-                    return await self.async_step_reconfigure_devices()
+                self._set_inventory(_devices_from_info(probe), bool(probe.devices))
+                if self._all_devices:
+                    return await self.async_step_domains()
                 errors["base"] = "no_devices"
 
         return self.async_show_form(
@@ -466,6 +531,7 @@ class SavantConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_USERNAME: self._username,
                 CONF_PASSWORD: self._password,
                 CONF_DEVICES: [dict(d) for d in devices if d["id"] in selected],
+                CONF_DOMAINS: self._domains or selected_domains(self._reconfigure_entry.data),
             }
         )
         if self._media_topology is not None:

@@ -55,7 +55,16 @@ Settings → Devices & Services → **Add Integration** → **Savant**.
 2. **Log in** with a host-local account (username/password). This is how the host
    authenticates a headless client; on success the integration authenticates, downloads
    the host's config archive (`uiconfig.tar.gz`), and enumerates the device inventory.
-3. **Choose the devices** to import. Devices are individual
+3. **Choose what to import** — tick the groups you want: *Media players and AV
+   remotes*, *Lights*, *Climate*, *Shades and covers*, *Fans*, *Savant scenes*, and
+   *Room and endpoint diagnostic sensors*. Only groups present on your host are offered,
+   with device counts. Unticked groups are left out of the device picker and their
+   Home Assistant platforms are not loaded at all, so a media-only install never
+   subscribes to lighting or HVAC state. The CoolMasterNet and Lutron prompts below only
+   appear when you pick Climate or Lights/Shades respectively. **Reconfigure** offers the
+   same choice again (pre-filled with your current selection). Entries created before
+   this step keep every group.
+4. **Choose the devices** to import. Devices are individual
    controllable things (a light load, a thermostat, a shade, a fan, an AV zone, …) — not
    rooms — and each maps to one or more Home Assistant entities. On accept the entities
    are created (you can move them freely afterwards).
@@ -130,6 +139,8 @@ Lutron matching diagnostics are logged, even at DEBUG level.
 | Fan | `FanEntities` | exact per-device state, read-only |
 | Media Player | `ServiceImplementationZonedService` (one selectable source or Apple TV endpoint per room) | music: browsing, global catalog search, playback, now-playing, power, volume, transport, and album art; Apple TV: archive-declared power, volume, and play/pause |
 | Scene | Savant dashboard `scenesAndFoldersReduced` updates | standalone native `scene.turn_on` activation |
+| Remote | each imported AV endpoint with a declared request list | `remote.send_command` for any archive-declared request; on/off via PowerOn/PowerOff |
+| Sensor / Binary sensor | `RoomCapabilities` rooms and imported AV endpoints | diagnostics: host connectivity, per-room active service/volume/zone flags, per-endpoint power/input/volume |
 
 ## Shared media-server routing
 

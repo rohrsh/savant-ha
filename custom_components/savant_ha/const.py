@@ -49,6 +49,63 @@ DEVICE_TYPE_LOCK = "lock"
 DEVICE_TYPE_MEDIA_PLAYER = "media_player"
 DEVICE_TYPE_ROOM = "room"
 
+# ---- Import domains (config-flow "domains" step) ----------------------------
+# Not protocol knowledge: a user-facing grouping of this integration's own HA
+# platforms, chosen at setup so a host can be imported for e.g. media only.
+CONF_DOMAINS = "domains"  # selected import groups (list[str]); absent = all (legacy)
+
+IMPORT_DOMAIN_MEDIA = "media_player"
+IMPORT_DOMAIN_LIGHT = "light"
+IMPORT_DOMAIN_CLIMATE = "climate"
+IMPORT_DOMAIN_COVER = "cover"
+IMPORT_DOMAIN_FAN = "fan"
+IMPORT_DOMAIN_SCENE = "scene"
+IMPORT_DOMAIN_DIAGNOSTICS = "diagnostics"
+
+# group -> (label, HA platform names, device-list types the group imports).
+# Scenes are not archive devices (they arrive as dashboard pushes), so the scene
+# group imports no device rows; diagnostics are the per-room/per-endpoint sensors.
+IMPORT_DOMAINS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    IMPORT_DOMAIN_MEDIA: (
+        "Media players and AV remotes", ("media_player", "remote"), (DEVICE_TYPE_MEDIA_PLAYER,)
+    ),
+    IMPORT_DOMAIN_LIGHT: ("Lights", ("light",), (DEVICE_TYPE_LIGHT,)),
+    IMPORT_DOMAIN_CLIMATE: ("Climate", ("climate",), (DEVICE_TYPE_CLIMATE,)),
+    IMPORT_DOMAIN_COVER: ("Shades and covers", ("cover",), (DEVICE_TYPE_COVER,)),
+    IMPORT_DOMAIN_FAN: ("Fans (read-only)", ("fan",), (DEVICE_TYPE_FAN,)),
+    IMPORT_DOMAIN_SCENE: ("Savant scenes", ("scene",), ()),
+    IMPORT_DOMAIN_DIAGNOSTICS: (
+        "Room and endpoint diagnostic sensors", ("sensor", "binary_sensor"), (DEVICE_TYPE_ROOM,)
+    ),
+}
+
+
+def selected_domains(data: dict[str, Any]) -> list[str]:
+    """Return the entry's import groups; entries created before the step get all."""
+    stored = data.get(CONF_DOMAINS)
+    if not stored:
+        return list(IMPORT_DOMAINS)
+    return [domain for domain in IMPORT_DOMAINS if domain in stored]
+
+
+def platforms_for_domains(domains: list[str]) -> list[str]:
+    """Return the HA platform names to forward for the selected import groups."""
+    platforms: list[str] = []
+    for domain in domains:
+        for platform in IMPORT_DOMAINS.get(domain, ("", (), ()))[1]:
+            if platform not in platforms:
+                platforms.append(platform)
+    return sorted(platforms)
+
+
+def device_types_for_domains(domains: list[str]) -> set[str]:
+    """Return the device-list ``type`` values the selected groups import."""
+    return {
+        device_type
+        for domain in domains
+        for device_type in IMPORT_DOMAINS.get(domain, ("", (), ()))[2]
+    }
+
 # ---- Protocol (PROTOCOL.md §1) --------------------------------------------
 # WebSocket subprotocol negotiated on the control channel.
 RPM_SUBPROTOCOL = "rpm-protocol"  # PROTOCOL.md §1

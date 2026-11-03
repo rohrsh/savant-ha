@@ -1331,3 +1331,9 @@ No idea where he PLATFORMS trim came from
 
 trim anything remotely PII/personal from CSV rows please"
 "1791456000000","2026-10-08T10:40:00.000000Z","flagged","Flagged changes","FLAGGED, NOT A PROMPT: custom_components/savant_ha/__init__.py PLATFORMS trimmed to MEDIA_PLAYER + REMOTE (BINARY_SENSOR, CLIMATE, COVER, FAN, LIGHT, SCENE, SENSOR commented out). Found as an uncommitted edit already running on the operator's HA (2026-09-29); no prompt in this CSV or in any session transcript, and the operator does not know its origin. Marked in source with '# NOTE: unprompted change — needs review'."
+1793684861156,2026-11-03T05:47:41.159Z,ses_claude_013C8WKh5PGtPCAE7S1Jeq3G,Merge upstream + AV branch; domain chooser,"ok yes please bring up to date with hpux735/main, that's where my project was originally cloned from. 
+
+perhaps his media work duplicates some of mine? Check for conflicts before blindly merging
+
+for my personal situation it's likely only media entities that I want. I'd like a config flow that chooses which domains"
+1793684861157,2026-11-03T05:47:41.159Z,flagged,Flagged changes,"RESOLVED, NOT A PROMPT: the flagged media-only PLATFORMS trim in custom_components/savant_ha/__init__.py (row 2026-10-08 'Flagged changes') is removed. PLATFORMS is the full list again and the config-flow 'domains' step (prompt above: 'I'd like a config flow that chooses which domains') now selects the forwarded platforms per entry, so the '# NOTE: unprompted change' marker is gone."
